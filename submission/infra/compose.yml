@@ -74,30 +74,6 @@ services:
       redis-cluster:
         ipv4_address: 10.10.0.16
 
-  redis-node-7:
-    image: redis-node-base:latest
-    container_name: redis-node-7
-    hostname: redis-node-7
-    ports:
-      - "2227:22"
-    volumes:
-      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
-    networks:
-      redis-cluster:
-        ipv4_address: 10.10.0.17
-
-  redis-node-8:
-    image: redis-node-base:latest
-    container_name: redis-node-8
-    hostname: redis-node-8
-    ports:
-      - "2228:22"
-    volumes:
-      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
-    networks:
-      redis-cluster:
-        ipv4_address: 10.10.0.18
-
 networks:
   redis-cluster:
     driver: bridge
