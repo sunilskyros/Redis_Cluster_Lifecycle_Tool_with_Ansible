@@ -1,0 +1,8 @@
+- name: Stop Redis for restart
+  ansible.builtin.include_tasks: stop.yml
+
+- name: Start Redis after restart
+  ansible.builtin.include_tasks: start.yml
+
+- name: Wait for Redis after restart
+  ansible.builtin.include_tasks: wait_ready.yml

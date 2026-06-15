@@ -1,0 +1,18 @@
+port {{ redis_port }}
+bind {{ redis_bind }}
+protected-mode no
+daemonize yes
+supervised no
+pidfile {{ redis_run_dir }}/redis-{{ redis_port }}.pid
+logfile "{{ redis_log_dir }}/redis-{{ redis_port }}.log"
+dir {{ redis_data_dir }}
+
+appendonly yes
+save ""
+
+cluster-enabled yes
+cluster-config-file {{ redis_cluster_config_file }}
+cluster-node-timeout {{ redis_cluster_node_timeout }}
+cluster-announce-ip {{ redis_cluster_ip | default(ansible_host) }}
+cluster-announce-port {{ redis_port }}
+cluster-announce-bus-port {{ redis_cluster_bus_port }}

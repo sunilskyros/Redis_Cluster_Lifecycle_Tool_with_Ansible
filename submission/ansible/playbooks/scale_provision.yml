@@ -1,0 +1,8 @@
+- name: Install and start Redis on new nodes
+  hosts: redis_nodes
+  gather_facts: true
+  become: true
+  vars_files:
+    - "../group_vars/all.yml"
+  roles:
+    - redis

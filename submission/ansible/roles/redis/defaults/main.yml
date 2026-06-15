@@ -1,0 +1,17 @@
+redis_version: "7.0.15"
+redis_user: redis
+redis_group: redis
+redis_port: 6379
+redis_bind: "0.0.0.0"
+redis_install_prefix: /opt/redis
+redis_current_symlink: /opt/redis/current
+redis_build_root: /usr/local/src
+redis_config_dir: /etc/redis
+redis_data_dir: "/var/lib/redis/{{ redis_port }}"
+redis_log_dir: /var/log/redis
+redis_run_dir: /run/redis
+redis_cluster_config_file: nodes.conf
+redis_cluster_node_timeout: 5000
+redis_cluster_bus_port: 16379
+redis_source_url: "https://download.redis.io/releases/redis-{{ redis_version }}.tar.gz"
+redis_make_jobs: 2

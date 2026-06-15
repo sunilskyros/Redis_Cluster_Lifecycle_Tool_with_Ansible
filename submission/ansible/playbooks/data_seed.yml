@@ -1,0 +1,56 @@
+- name: Seed deterministic Redis Cluster data
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Insert deterministic keys and report master distribution
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cli="{{ redis_current_symlink }}/bin/redis-cli"
+        inserted=0
+        failures=0
+
+        # Flush all master nodes to ensure a clean seed matching the requested key count
+        "$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES \
+          | awk '$3 ~ /master/ && $3 !~ /fail/ { split($2, addr, "@"); print addr[1] }' \
+          | while IFS=: read -r host port; do
+              "$cli" -h "$host" -p "$port" FLUSHDB >/dev/null
+            done
+
+        for n in $(seq 1 {{ keys_count | int }}); do
+          suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
+          key="{{ data_key_prefix }}${suffix}"
+          value=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
+          if "$cli" -c -h "{{ first_ip }}" -p "{{ redis_port }}" SET "$key" "$value" >/dev/null; then
+            inserted=$((inserted + 1))
+          else
+            failures=$((failures + 1))
+          fi
+        done
+
+        echo "Seed Summary"
+        echo "total keys requested: {{ keys_count | int }}"
+        echo "total keys inserted: ${inserted}"
+        echo "failures: ${failures}"
+        echo "distribution across masters:"
+        "$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES \
+          | awk '$3 ~ /master/ && $3 !~ /fail/ { split($2, addr, "@"); print addr[1] }' \
+          | while IFS=: read -r host port; do
+              keys=$("$cli" -h "$host" -p "$port" DBSIZE)
+              echo "${host}:${port} keys=${keys}"
+            done
+
+        test "$failures" -eq 0
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ first_node }}"
+      register: seed_result
+      changed_when: true
+
+    - name: Seed result
+      ansible.builtin.debug:
+        msg: "{{ seed_result.stdout_lines }}"

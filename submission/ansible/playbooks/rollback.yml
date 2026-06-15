@@ -1,0 +1,54 @@
+- name: Rollback Redis Cluster to target version
+  hosts: redis_nodes
+  gather_facts: true
+  become: true
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    redis_version: "{{ target_version }}"
+  tasks:
+    - name: Stop Redis cleanly
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: stop
+
+    - name: Ensure target version is installed
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: install
+
+    - name: Clean database files for downgrade compatibility
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ redis_data_dir }}/dump.rdb"
+        - "{{ redis_data_dir }}/appendonlydir"
+
+    - name: Start Redis daemon on target version
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: start
+
+    - name: Wait for Redis readiness
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: wait_ready
+
+- name: Wait for cluster to stabilize
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Wait for cluster state ok
+      ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ first_ip }} -p {{ redis_port }} CLUSTER INFO"
+      delegate_to: "{{ first_node }}"
+      register: cluster_info
+      retries: 30
+      delay: 2
+      until: "'cluster_state:ok' in cluster_info.stdout"
+      changed_when: false
