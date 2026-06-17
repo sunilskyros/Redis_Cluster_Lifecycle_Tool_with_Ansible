@@ -6,7 +6,7 @@ This submission builds a six-node Redis Cluster lifecycle tool for the DevOps En
 
 ```text
 submission/
-├── redis-tool          ← CLI + embedded test suite
+├── redis-tool
 ├── ansible/
 │   ├── ansible.cfg
 │   ├── group_vars/all.yml
@@ -26,9 +26,7 @@ submission/
 `redis-tool` checks these before running any command:
 
 - Podman or Docker. If both are installed, Podman is preferred.
-- Compose support — resolved **automatically** in this priority order:
-  - **Podman**: `podman-compose` *(preferred — no socket needed)*, then `podman compose` plugin
-  - **Docker**: `docker compose` *(preferred)*, then legacy `docker-compose`
+- Compose support: `podman-compose`, `podman compose`, `docker compose`, or `docker-compose`.
 - Ansible 2.14+ through `ansible-playbook`.
 - `ssh-keygen` for `./redis-tool infra up`.
 
@@ -37,27 +35,6 @@ Install references:
 - Podman: https://podman.io/docs/installation
 - Docker Engine: https://docs.docker.com/engine/install/
 - Ansible: `pip install ansible` or your OS package manager
-
-### ⚡ No manual socket setup required
-
-On fresh Linux systems, `redis-tool` **automatically** handles the Podman socket:
-
-1. It first tries `podman-compose`, a pure-CLI wrapper with **no socket dependency**.
-2. If only the `podman compose` plugin is available, it auto-starts `podman.socket`
-   via `systemctl --user start podman.socket`.
-3. If the socket cannot be activated, a clear actionable error is shown.
-
-**Recommended setup for Podman users (zero socket config):**
-```bash
-pip install podman-compose
-```
-
-**Override the runtime at any time:**
-```bash
-./redis-tool --runtime docker infra up
-# or
-CONTAINER_RUNTIME=docker ./redis-tool infra up
-```
 
 ## Bring Up Infrastructure
 
@@ -116,23 +93,6 @@ Run full verification:
 
 Each command writes a terminal transcript to `output/` and structured JSONL events to `logs/`.
 
-## Running Tests
-
-Tests are embedded directly in `redis-tool` — no extra files or packages needed:
-
-```bash
-./redis-tool test
-# or
-python3 redis-tool test
-```
-
-The test suite covers:
-- Runtime auto-detection (Podman preferred, Docker fallback, env var overrides)
-- Compose command selection (socket-free `podman-compose` vs API plugin)
-- Automatic Podman socket activation via systemd
-- `is_infra_running` including name-based fallback for older Podman versions
-- `check_runtime_connectivity` and `check_prereqs` gate logic
-
 ## Rolling Upgrade Strategy
 
 The upgrade playbook implements the required no-downtime strategy:
@@ -164,3 +124,4 @@ Because the value can be recomputed independently, `data verify`, `upgrade`, and
 
 - Initial Redis source downloads require internet access from the containers.
 - Rootless Podman networking with static IPs depends on the installed Podman and podman-compose versions. Docker Compose is a fallback if Podman networking is unavailable.
+- Rollback, scale-out, and scale-in are not implemented because they are stretch goals.

@@ -13,7 +13,7 @@ redis_cluster_config_file: nodes.conf
 redis_cluster_node_timeout: 5000
 redis_cluster_bus_port: 16379
 redis_source_url: "https://download.redis.io/releases/redis-{{ redis_version }}.tar.gz"
-redis_make_jobs: "{{ ansible_processor_vcpus | default(2) }}"
+redis_make_jobs: 1
 
 cluster_slots_total: 16384
 cluster_masters_count: 3
