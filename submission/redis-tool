@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 import time
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, TypedDict
+from typing import Iterable, Optional, TypedDict
 
 
 
@@ -72,8 +73,12 @@ def print_missing_prereqs(messages: list[str]) -> None:
 
 
 def detect_container_runtime(runtime_override: str | None = None) -> dict[str, object] | None:
+    """Detect the available container runtime (Podman preferred, then Docker).
+
+    Uses *only* CLI invocation — no socket or REST API required.
+    """
     target = runtime_override or os.environ.get("CONTAINER_RUNTIME", "").lower()
-    
+
     if target:
         if target == "podman":
             if shutil.which("podman"):
@@ -97,15 +102,32 @@ def detect_container_runtime(runtime_override: str | None = None) -> dict[str, o
 
 
 def detect_compose(runtime: dict[str, object]) -> list[str] | None:
+    """Detect the best compose command for the given runtime.
+
+    Priority for Podman:
+      1. ``podman-compose`` — pure Python CLI, works rootless with **no** socket.
+      2. ``podman compose`` — Compose V2 plugin; requires the Podman REST API
+         socket.  We probe it last and only after socket activation is attempted.
+
+    Priority for Docker:
+      1. ``docker compose`` — modern Compose V2 plugin (recommended).
+      2. ``docker-compose`` — legacy standalone binary.
+    """
     name = runtime["name"]
     if name == "podman":
+        # Prefer podman-compose: it is a pure CLI wrapper that does NOT need the
+        # Podman REST-API socket, making it safe on fresh / rootless systems.
         if shutil.which("podman-compose"):
             return ["podman-compose"]
-        proc = run_capture(["podman", "compose", "version"])
-        if proc.returncode == 0:
-            return ["podman", "compose"]
+        # Fall back to the Compose V2 plugin.  This communicates via the Podman
+        # REST API socket, so we attempt automatic socket activation first.
+        if _try_ensure_podman_socket():
+            proc = run_capture(["podman", "compose", "version"])
+            if proc.returncode == 0:
+                return ["podman", "compose"]
         return None
 
+    # Docker path
     proc = run_capture(["docker", "compose", "version"])
     if proc.returncode == 0:
         return ["docker", "compose"]
@@ -114,7 +136,137 @@ def detect_compose(runtime: dict[str, object]) -> list[str] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Podman socket helpers
+# ---------------------------------------------------------------------------
+
+def _podman_socket_path() -> Optional[Path]:
+    """Return the expected user-level Podman REST API socket path, or None."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        p = Path(xdg) / "podman" / "podman.sock"
+        if p.exists():
+            return p
+    uid = os.getuid()
+    fallback = Path(f"/run/user/{uid}/podman/podman.sock")
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def _systemctl_user_available() -> bool:
+    """Return True when the calling process can reach a user systemd session."""
+    proc = run_capture(["systemctl", "--user", "is-system-running"])
+    # Acceptable states: running, degraded.  We just need *some* user session.
+    return proc.returncode in (0, 1) or proc.stdout.strip() in (
+        "running", "degraded", "starting"
+    )
+
+
+def _try_ensure_podman_socket() -> bool:
+    """Attempt to activate podman.socket and return True on success.
+
+    Strategy (no side-effects if the socket is already active):
+    1. If the socket file already exists, return True immediately.
+    2. Try ``systemctl --user start podman.socket``.
+    3. Wait up to 5 s for the socket file to appear.
+    4. If systemd is not available or the socket still does not exist, return
+       False so the caller can produce a clear, actionable error message.
+    """
+    if _podman_socket_path() is not None:
+        return True
+
+    if not shutil.which("systemctl"):
+        return False
+
+    if not _systemctl_user_available():
+        return False
+
+    print("[INFO] Podman socket is not active — attempting automatic activation via systemd...")
+    proc = run_capture(["systemctl", "--user", "start", "podman.socket"])
+    if proc.returncode != 0:
+        # Try enable + start as a fallback (first-time setup)
+        run_capture(["systemctl", "--user", "enable", "podman.socket"])
+        proc = run_capture(["systemctl", "--user", "start", "podman.socket"])
+        if proc.returncode != 0:
+            return False
+
+    # Wait for the socket file to materialise (up to 5 s)
+    for _ in range(10):
+        if _podman_socket_path() is not None:
+            print("[OK] Podman socket activated successfully.")
+            return True
+        time.sleep(0.5)
+
+    return False
+
+
+def ensure_podman_socket() -> None:
+    """Activate podman.socket or raise ToolError with clear instructions."""
+    if _try_ensure_podman_socket():
+        return
+    raise ToolError(
+        "The 'podman compose' plugin requires the Podman REST API socket, "
+        "but the socket could not be activated automatically.\n"
+        "\n"
+        "To fix this manually, run:\n"
+        "  systemctl --user enable --now podman.socket\n"
+        "\n"
+        "Alternatively, install podman-compose (no socket needed):\n"
+        "  pip install podman-compose\n"
+        "  # or: dnf/apt install podman-compose\n"
+        "\n"
+        "Or switch to Docker:\n"
+        "  ./redis-tool --runtime docker infra up"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runtime connectivity check
+# ---------------------------------------------------------------------------
+
+def check_runtime_connectivity(runtime: dict[str, object]) -> None:
+    """Verify the container runtime CLI is operational (no daemon/socket needed).
+
+    For Podman this just runs ``podman info`` which works without a socket in
+    rootless mode.  For Docker it runs ``docker info`` which requires the daemon
+    to be running, and we provide actionable guidance on failure.
+    """
+    name = runtime["name"]
+    cmd = runtime["cmd"]
+    assert isinstance(cmd, list)
+    proc = run_capture(cmd + ["info"])
+    if proc.returncode == 0:
+        return
+
+    if name == "docker":
+        raise ToolError(
+            "Docker is installed but the Docker daemon is not running.\n"
+            "Start it with one of:\n"
+            "  sudo systemctl start docker      # Linux (systemd)"
+            "  open -a Docker                   # macOS (Docker Desktop)\n"
+            "\n"
+            "If you have Podman installed you can use it instead:\n"
+            "  ./redis-tool --runtime podman infra up"
+        )
+    if name == "podman":
+        # podman info should work rootless.  If it fails the install may be
+        # broken, but we give the user a useful hint.
+        raise ToolError(
+            "Podman is installed but 'podman info' failed.\n"
+            "This can happen if the Podman storage or network configuration is\n"
+            "incomplete.  Try running 'podman system reset' or re-installing Podman.\n"
+            f"\nError output:\n{proc.stdout.strip()}"
+        )
+
+
 def check_prereqs(runtime_override: str | None = None) -> dict[str, object]:
+    """Check all prerequisites and return a context dict on success.
+
+    Performs only CLI-level checks — no socket or daemon required at this
+    stage.  Compose and socket availability are validated lazily when the
+    user actually runs ``infra up``.
+    """
     messages: list[str] = []
     runtime = detect_container_runtime(runtime_override)
     if runtime is None:
@@ -155,11 +307,36 @@ def check_prereqs(runtime_override: str | None = None) -> dict[str, object]:
         raise SystemExit(2)
 
     assert runtime is not None
+    # Verify the runtime CLI is operational (does not require a daemon/socket).
+    check_runtime_connectivity(runtime)
+
+    compose = detect_compose(runtime)
+    if compose is None:
+        runtime_name = runtime["name"]
+        if runtime_name == "podman":
+            print(
+                "[ERROR] No Compose support found for Podman.\n"
+                "Install podman-compose (no socket needed):\n"
+                "  pip install podman-compose\n"
+                "  # or: dnf install podman-compose / apt install podman-compose\n"
+                "Alternatively, install the Podman Compose V2 plugin and enable the\n"
+                "Podman socket:\n"
+                "  systemctl --user enable --now podman.socket"
+            )
+        else:
+            print(
+                "[ERROR] No Compose support found for Docker.\n"
+                "Install Docker Compose V2:\n"
+                "  https://docs.docker.com/compose/install/"
+            )
+        raise SystemExit(2)
+
     print(f"[OK] {runtime['version']} found")
+    print(f"[OK] compose command: {' '.join(compose)}")
     print(f"[OK] {ansible_version} found")
     print("Proceeding...")
     print()
-    return {"runtime": runtime, "ansible": ansible}
+    return {"runtime": runtime, "compose": compose, "ansible": ansible}
 
 
 def log_event(operation: str, action: str, status: str, **extra: object) -> None:
@@ -400,15 +577,21 @@ def ensure_ssh_key() -> None:
     AUTHORIZED_KEYS.chmod(0o644)
 
 
-def compose_command(runtime: dict[str, object], action: str, services: list[str] | None = None) -> list[str]:
-    compose = detect_compose(runtime)
+def compose_command(context: dict[str, object], action: str, services: list[str] | None = None) -> list[str]:
+    """Build the compose command list for *action* using the pre-resolved compose binary."""
+    compose = context.get("compose")
+    if not compose:
+        # Fallback: detect at call-time (e.g. in tests that skip check_prereqs)
+        runtime = context["runtime"]
+        assert isinstance(runtime, dict)
+        compose = detect_compose(runtime)
     if compose is None:
         raise ToolError(
             "Compose support not found for the selected runtime.\n"
             "Install podman-compose for Podman or Docker Compose for Docker."
         )
 
-    base = compose + ["-f", str(INFRA_DIR / "compose.yml")]
+    base = list(compose) + ["-f", str(INFRA_DIR / "compose.yml")]
     if action == "up":
         cmd = base + ["up", "-d", "--build"]
         if services:
@@ -431,7 +614,7 @@ def cmd_infra(args: argparse.Namespace, context: dict[str, object]) -> int:
             shutil.copy2(df, cf)
         elif cf.exists() and not df.exists():
             shutil.copy2(cf, df)
-    cmd = compose_command(runtime, args.infra_action)
+    cmd = compose_command(context, args.infra_action)
     rc = stream_command(
         cmd,
         "infra",
@@ -440,18 +623,34 @@ def cmd_infra(args: argparse.Namespace, context: dict[str, object]) -> int:
     )
     if rc != 0:
         print("\n\033[1;31m[ERROR] Infrastructure command failed.\033[0m")
+        compose = context.get("compose", [])
+        assert isinstance(compose, list)
         if runtime["name"] == "podman":
             print("\033[1;33mHint for Podman users:\033[0m")
-            print("  If you encounter connection errors to 'podman.sock' (e.g. no such file or directory),")
-            print("  ensure that the Podman systemd socket service is running:")
-            print("    systemctl --user enable --now podman.socket")
-            print("  Alternatively, if you prefer to use Docker instead, you can run the tool with:")
-            print("    --runtime docker   (or set CONTAINER_RUNTIME=docker environment variable)")
+            if compose and compose[0] == "podman" and len(compose) > 1 and compose[1] == "compose":
+                # Using the API-based plugin — socket may have dropped
+                print("  The 'podman compose' plugin requires the Podman REST API socket.")
+                print("  Attempting to restart the socket...")
+                if _try_ensure_podman_socket():
+                    print("  Socket restarted. Retrying the infra command...")
+                    rc = stream_command(
+                        cmd,
+                        "infra",
+                        OUTPUT_DIR / f"infra_{args.infra_action}_output.txt",
+                        cwd=INFRA_DIR,
+                    )
+                    if rc == 0:
+                        return rc
+                print("  If the problem persists, install podman-compose (no socket needed):")
+                print("    pip install podman-compose")
+            print("  Or use Docker instead:")
+            print("    --runtime docker   (or CONTAINER_RUNTIME=docker)")
         elif runtime["name"] == "docker":
             print("\033[1;33mHint for Docker users:\033[0m")
-            print("  Ensure that the Docker daemon is running (e.g., systemctl start docker or docker-desktop).")
-            print("  If you have Podman installed but want to force Docker, run the tool with:")
-            print("    --runtime docker   (or set CONTAINER_RUNTIME=docker environment variable)")
+            print("  Ensure the Docker daemon is running:")
+            print("    sudo systemctl start docker")
+            print("  Or use Podman instead (if installed):")
+            print("    --runtime podman   (or CONTAINER_RUNTIME=podman)")
         print()
     return rc
 
@@ -600,9 +799,11 @@ def resolve_port_conflicts(context: dict[str, object]) -> None:
     if not nodes:
         return
 
-    runtime = context["runtime"]
-    assert isinstance(runtime, dict)
-    compose = detect_compose(runtime)
+    compose = context.get("compose")
+    if not compose:
+        runtime = context["runtime"]
+        assert isinstance(runtime, dict)
+        compose = detect_compose(runtime)
     if not compose:
         return
 
@@ -799,7 +1000,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
 
     runtime = context["runtime"]
     assert isinstance(runtime, dict)
-    cmd = compose_command(runtime, "up", new_node_names)
+    cmd = compose_command(context, "up", new_node_names)
     rc = stream_command(
         cmd,
         "infra",
@@ -1250,20 +1451,48 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def is_infra_running(context: dict[str, object]) -> bool:
+    """Return True when all expected containers are running.
+
+    Uses only ``<runtime> ps`` CLI, which works without the Podman REST API
+    socket (rootless Podman supports ``podman ps`` directly).
+    """
     runtime = context["runtime"]
     assert isinstance(runtime, dict)
-    cmd = runtime["cmd"]
-    proc = run_capture(cmd + [
-        "ps",
-        "--filter", "label=com.docker.compose.project=infra",
-        "--filter", "status=running",
-        "-q"
-    ])
-    if proc.returncode != 0:
+    cmd = list(runtime["cmd"])
+    try:
+        proc = run_capture(cmd + [
+            "ps",
+            "--filter", "label=com.docker.compose.project=infra",
+            "--filter", "status=running",
+            "-q",
+        ])
+        if proc.returncode != 0:
+            # The filter approach can fail on older Podman versions; fall back to
+            # checking each container by name.
+            return _is_infra_running_by_name(cmd)
+        running = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        expected = len(parse_inventory())
+        if len(running) >= expected and expected > 0:
+            return True
+        # Label filter may return 0 even when containers exist (older Podman/compose
+        # versions may not set compose labels).  Fall back to name-based check.
+        return _is_infra_running_by_name(cmd)
+    except Exception:
         return False
-    running = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    expected = len(parse_inventory())
-    return len(running) >= expected and expected > 0
+
+
+def _is_infra_running_by_name(runtime_cmd: list[str]) -> bool:
+    """Fallback: check containers listed in the inventory are running by name."""
+    nodes = parse_inventory()
+    if not nodes:
+        return False
+    running_count = 0
+    for node in nodes:
+        name = node["name"]
+        proc = run_capture(runtime_cmd + ["inspect", "--format", "{{.State.Running}}", name])
+        if proc.returncode == 0 and proc.stdout.strip().lower() == "true":
+            running_count += 1
+    return running_count >= len(nodes)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -1287,5 +1516,403 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 130
 
 
+# ---------------------------------------------------------------------------
+# Self-contained test suite
+# Run with:  ./redis-tool test   or   python3 redis-tool test
+# ---------------------------------------------------------------------------
+
+class _MockProc:
+    """Minimal stand-in for subprocess.CompletedProcess used in tests."""
+    def __init__(self, returncode: int = 0, stdout: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def _mp(returncode: int = 0, stdout: str = "") -> _MockProc:
+    return _MockProc(returncode, stdout)
+
+
+class TestDetectContainerRuntime(unittest.TestCase):
+    """detect_container_runtime() — auto-detection and overrides."""
+
+    def test_returns_none_when_neither_installed(self):
+        with unittest.mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(detect_container_runtime())
+
+    def test_prefers_podman_over_docker(self):
+        """Podman must be chosen when both runtimes are on PATH."""
+        with unittest.mock.patch("shutil.which", side_effect=lambda n: f"/usr/bin/{n}"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "podman version 4.9.3")):
+            result = detect_container_runtime()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "podman")  # type: ignore[index]
+
+    def test_falls_back_to_docker_when_no_podman(self):
+        with unittest.mock.patch("shutil.which",
+                                  side_effect=lambda n: None if n == "podman" else f"/usr/bin/{n}"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "Docker version 24.0.5")):
+            result = detect_container_runtime()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "docker")  # type: ignore[index]
+
+    def test_runtime_override_podman(self):
+        with unittest.mock.patch("shutil.which", return_value="/usr/bin/podman"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "podman version 4.9.3")):
+            result = detect_container_runtime("podman")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "podman")  # type: ignore[index]
+
+    def test_runtime_override_missing_returns_none(self):
+        with unittest.mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(detect_container_runtime("docker"))
+
+    def test_env_var_selects_docker(self):
+        with unittest.mock.patch("shutil.which", return_value="/usr/bin/docker"), \
+             unittest.mock.patch.dict("os.environ", {"CONTAINER_RUNTIME": "docker"}), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "Docker version 24.0.5")):
+            result = detect_container_runtime()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "docker")  # type: ignore[index]
+
+    def test_explicit_override_beats_env_var(self):
+        """--runtime docker wins over CONTAINER_RUNTIME=podman."""
+        with unittest.mock.patch("shutil.which", return_value="/usr/bin/docker"), \
+             unittest.mock.patch.dict("os.environ", {"CONTAINER_RUNTIME": "podman"}), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "Docker version 24.0.5")):
+            result = detect_container_runtime("docker")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "docker")  # type: ignore[index]
+
+
+class TestDetectCompose(unittest.TestCase):
+    """detect_compose() — compose tool selection."""
+
+    _podman = {"name": "podman", "cmd": ["podman"], "version": "podman 4.9"}
+    _docker = {"name": "docker", "cmd": ["docker"], "version": "Docker 24.0"}
+
+    def test_podman_compose_preferred_no_socket_needed(self):
+        """podman-compose (socket-free) must win over the compose plugin."""
+        with unittest.mock.patch("shutil.which",
+                                  side_effect=lambda n: "/usr/bin/podman-compose" if n == "podman-compose" else None):
+            self.assertEqual(detect_compose(self._podman), ["podman-compose"])
+
+    def test_podman_plugin_used_when_socket_activates(self):
+        with unittest.mock.patch("shutil.which", return_value=None), \
+             unittest.mock.patch.object(sys.modules[__name__], "_try_ensure_podman_socket",
+                                        return_value=True), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "Docker Compose version v2.21.0")):
+            self.assertEqual(detect_compose(self._podman), ["podman", "compose"])
+
+    def test_podman_returns_none_when_no_compose_no_socket(self):
+        with unittest.mock.patch("shutil.which", return_value=None), \
+             unittest.mock.patch.object(sys.modules[__name__], "_try_ensure_podman_socket",
+                                        return_value=False):
+            self.assertIsNone(detect_compose(self._podman))
+
+    def test_docker_compose_v2_preferred(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "Docker Compose version v2.21.0")):
+            self.assertEqual(detect_compose(self._docker), ["docker", "compose"])
+
+    def test_docker_legacy_fallback(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(1, "")), \
+             unittest.mock.patch("shutil.which",
+                                  side_effect=lambda n: "/usr/bin/docker-compose" if n == "docker-compose" else None):
+            self.assertEqual(detect_compose(self._docker), ["docker-compose"])
+
+    def test_docker_returns_none_when_nothing_available(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(1, "")), \
+             unittest.mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(detect_compose(self._docker))
+
+
+class TestPodmanSocketPath(unittest.TestCase):
+    """_podman_socket_path() — socket file location logic."""
+
+    def test_returns_none_when_socket_absent(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=True), \
+             unittest.mock.patch.object(Path, "exists", return_value=False):
+            self.assertIsNone(_podman_socket_path())
+
+    def test_returns_xdg_path_when_present(self):
+        fake_xdg = "/run/user/1000"
+        expected = Path(fake_xdg) / "podman" / "podman.sock"
+        with unittest.mock.patch.dict("os.environ", {"XDG_RUNTIME_DIR": fake_xdg}), \
+             unittest.mock.patch.object(Path, "exists", lambda self: str(self) == str(expected)):
+            self.assertEqual(_podman_socket_path(), expected)
+
+    def test_returns_fallback_path_when_present(self):
+        uid = 1000
+        fallback = Path(f"/run/user/{uid}/podman/podman.sock")
+        with unittest.mock.patch.dict("os.environ", {}, clear=True), \
+             unittest.mock.patch("os.getuid", return_value=uid), \
+             unittest.mock.patch.object(Path, "exists", lambda self: str(self) == str(fallback)):
+            self.assertEqual(_podman_socket_path(), fallback)
+
+
+class TestTryEnsurePodmanSocket(unittest.TestCase):
+    """_try_ensure_podman_socket() — automatic socket activation."""
+
+    def test_true_when_socket_already_exists(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "_podman_socket_path",
+                                        return_value=Path("/run/user/1000/podman/podman.sock")):
+            self.assertTrue(_try_ensure_podman_socket())
+
+    def test_false_when_no_systemctl(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "_podman_socket_path",
+                                        return_value=None), \
+             unittest.mock.patch("shutil.which", return_value=None):
+            self.assertFalse(_try_ensure_podman_socket())
+
+    def test_false_when_no_user_systemd(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "_podman_socket_path",
+                                        return_value=None), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             unittest.mock.patch.object(sys.modules[__name__], "_systemctl_user_available",
+                                        return_value=False):
+            self.assertFalse(_try_ensure_podman_socket())
+
+    def test_activates_socket_via_systemd(self):
+        appeared: list[bool] = []
+        def socket_side():
+            return None if not appeared else Path("/run/user/1000/podman/podman.sock")
+        with unittest.mock.patch.object(sys.modules[__name__], "_podman_socket_path",
+                                        side_effect=socket_side), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             unittest.mock.patch.object(sys.modules[__name__], "_systemctl_user_available",
+                                        return_value=True), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0)) as mock_rc, \
+             unittest.mock.patch("time.sleep", side_effect=lambda _: appeared.append(True)):
+            result = _try_ensure_podman_socket()
+        self.assertTrue(result)
+        calls_str = str(mock_rc.call_args_list)
+        self.assertIn("podman.socket", calls_str)
+
+    def test_false_when_socket_never_appears(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "_podman_socket_path",
+                                        return_value=None), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/systemctl"), \
+             unittest.mock.patch.object(sys.modules[__name__], "_systemctl_user_available",
+                                        return_value=True), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0)), \
+             unittest.mock.patch("time.sleep", return_value=None):
+            self.assertFalse(_try_ensure_podman_socket())
+
+
+class TestCheckRuntimeConnectivity(unittest.TestCase):
+    """check_runtime_connectivity() — per-runtime error guidance."""
+
+    def test_podman_ok_no_raise(self):
+        rt = {"name": "podman", "cmd": ["podman"], "version": "..."}
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture", return_value=_mp(0)):
+            check_runtime_connectivity(rt)  # must not raise
+
+    def test_podman_broken_raises(self):
+        rt = {"name": "podman", "cmd": ["podman"], "version": "..."}
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(1, "storage error")), \
+             self.assertRaises(ToolError) as ctx:
+            check_runtime_connectivity(rt)
+        self.assertIn("podman info", str(ctx.exception))
+
+    def test_docker_daemon_down_raises(self):
+        rt = {"name": "docker", "cmd": ["docker"], "version": "..."}
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(1, "Cannot connect")), \
+             self.assertRaises(ToolError) as ctx:
+            check_runtime_connectivity(rt)
+        self.assertIn("Docker daemon", str(ctx.exception))
+
+
+class TestIsInfraRunning(unittest.TestCase):
+    """is_infra_running() — container state detection."""
+
+    _ctx = {"runtime": {"name": "podman", "cmd": ["podman"], "version": "..."}}
+
+    def test_false_when_ps_fails_and_no_inventory(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(1, "")), \
+             unittest.mock.patch.object(sys.modules[__name__], "parse_inventory",
+                                        return_value=[]):
+            self.assertFalse(is_infra_running(self._ctx))
+
+    def test_true_when_label_filter_finds_all(self):
+        inv = [{"name": "redis-node-1"}, {"name": "redis-node-2"}]
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "abc\ndef\n")), \
+             unittest.mock.patch.object(sys.modules[__name__], "parse_inventory",
+                                        return_value=inv):
+            self.assertTrue(is_infra_running(self._ctx))
+
+    def test_name_fallback_when_label_returns_empty(self):
+        inv = [{"name": "redis-node-1"}, {"name": "redis-node-2"}]
+        def rc_side(cmd):
+            if "ps" in cmd:
+                return _mp(0, "")          # label filter: empty
+            if "inspect" in cmd:
+                return _mp(0, "true")      # containers are running
+            return _mp(0, "")
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        side_effect=rc_side), \
+             unittest.mock.patch.object(sys.modules[__name__], "parse_inventory",
+                                        return_value=inv):
+            self.assertTrue(is_infra_running(self._ctx))
+
+    def test_false_when_containers_stopped(self):
+        inv = [{"name": "redis-node-1"}]
+        def rc_side(cmd):
+            if "ps" in cmd:
+                return _mp(0, "")
+            if "inspect" in cmd:
+                return _mp(0, "false")
+            return _mp(0, "")
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        side_effect=rc_side), \
+             unittest.mock.patch.object(sys.modules[__name__], "parse_inventory",
+                                        return_value=inv):
+            self.assertFalse(is_infra_running(self._ctx))
+
+    def test_false_on_exception(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        side_effect=OSError("boom")):
+            self.assertFalse(is_infra_running(self._ctx))
+
+
+class TestComposeCommand(unittest.TestCase):
+    """compose_command() — command list construction."""
+
+    def _ctx(self, compose_cmd):
+        return {"runtime": {"name": "podman", "cmd": ["podman"], "version": "..."},
+                "compose": compose_cmd}
+
+    def test_up_includes_flags(self):
+        cmd = compose_command(self._ctx(["podman-compose"]), "up")
+        self.assertIn("up", cmd)
+        self.assertIn("-d", cmd)
+        self.assertIn("--build", cmd)
+
+    def test_down_command(self):
+        cmd = compose_command(self._ctx(["podman-compose"]), "down")
+        self.assertIn("down", cmd)
+
+    def test_up_with_services(self):
+        cmd = compose_command(self._ctx(["docker", "compose"]), "up",
+                              services=["redis-node-7", "redis-node-8"])
+        self.assertIn("redis-node-7", cmd)
+        self.assertIn("redis-node-8", cmd)
+
+    def test_raises_on_unknown_action(self):
+        with self.assertRaises(ToolError):
+            compose_command(self._ctx(["podman-compose"]), "restart")
+
+    def test_raises_when_no_compose_available(self):
+        ctx = {"runtime": {"name": "podman", "cmd": ["podman"], "version": "..."}}
+        with unittest.mock.patch.object(sys.modules[__name__], "detect_compose",
+                                        return_value=None), \
+             self.assertRaises(ToolError):
+            compose_command(ctx, "up")
+
+
+class TestCheckPrereqs(unittest.TestCase):
+    """check_prereqs() — gate logic for all prerequisites."""
+
+    def _all_ok_patches(self):
+        runtime = {"name": "podman", "cmd": ["podman"], "version": "podman 4.9"}
+        return [
+            unittest.mock.patch.object(sys.modules[__name__], "detect_container_runtime",
+                                       return_value=runtime),
+            unittest.mock.patch.object(sys.modules[__name__], "check_runtime_connectivity"),
+            unittest.mock.patch.object(sys.modules[__name__], "detect_compose",
+                                       return_value=["podman-compose"]),
+            unittest.mock.patch("shutil.which", return_value="/usr/bin/ansible-playbook"),
+            unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                       return_value=_mp(0, "ansible-playbook 2.16.0\n  python 3.11")),
+        ]
+
+    def test_returns_context_with_runtime_compose_ansible(self):
+        patches = self._all_ok_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            ctx = check_prereqs()
+        self.assertIn("runtime", ctx)
+        self.assertIn("compose", ctx)
+        self.assertIn("ansible", ctx)
+
+    def test_exits_2_when_no_runtime(self):
+        with unittest.mock.patch.object(sys.modules[__name__], "detect_container_runtime",
+                                        return_value=None), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/ansible-playbook"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "ansible-playbook 2.16.0")), \
+             self.assertRaises(SystemExit) as ctx:
+            check_prereqs()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_exits_2_when_ansible_missing(self):
+        runtime = {"name": "podman", "cmd": ["podman"], "version": "podman 4.9"}
+        with unittest.mock.patch.object(sys.modules[__name__], "detect_container_runtime",
+                                        return_value=runtime), \
+             unittest.mock.patch.object(sys.modules[__name__], "check_runtime_connectivity"), \
+             unittest.mock.patch.object(sys.modules[__name__], "detect_compose",
+                                        return_value=["podman-compose"]), \
+             unittest.mock.patch("shutil.which", return_value=None), \
+             self.assertRaises(SystemExit) as ctx:
+            check_prereqs()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_exits_2_when_compose_not_found(self):
+        runtime = {"name": "podman", "cmd": ["podman"], "version": "podman 4.9"}
+        with unittest.mock.patch.object(sys.modules[__name__], "detect_container_runtime",
+                                        return_value=runtime), \
+             unittest.mock.patch.object(sys.modules[__name__], "check_runtime_connectivity"), \
+             unittest.mock.patch.object(sys.modules[__name__], "detect_compose",
+                                        return_value=None), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/ansible-playbook"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "ansible-playbook 2.16.0")), \
+             self.assertRaises(SystemExit) as ctx:
+            check_prereqs()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_exits_2_when_ansible_too_old(self):
+        runtime = {"name": "podman", "cmd": ["podman"], "version": "podman 4.9"}
+        with unittest.mock.patch.object(sys.modules[__name__], "detect_container_runtime",
+                                        return_value=runtime), \
+             unittest.mock.patch.object(sys.modules[__name__], "check_runtime_connectivity"), \
+             unittest.mock.patch.object(sys.modules[__name__], "detect_compose",
+                                        return_value=["podman-compose"]), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/ansible-playbook"), \
+             unittest.mock.patch.object(sys.modules[__name__], "run_capture",
+                                        return_value=_mp(0, "ansible-playbook 2.10.0")), \
+             self.assertRaises(SystemExit) as ctx:
+            check_prereqs()
+        self.assertEqual(ctx.exception.code, 2)
+
+
+def _run_self_tests() -> int:
+    """Discover and run all TestCase classes defined above.  Returns exit code."""
+    # Need unittest.mock available — it ships with Python 3.3+.
+    import unittest.mock  # noqa: F401  (ensure side-effect import works in test classes)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for name, obj in list(globals().items()):
+        if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
+            suite.addTests(loader.loadTestsFromTestCase(obj))
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        raise SystemExit(_run_self_tests())
     raise SystemExit(main())
