@@ -1,6 +1,0 @@
-# Role-specific defaults.
-# Variables shared across the project are defined in group_vars/all.yml.
-# Only role-internal defaults that callers might want to override belong here.
-redis_version: "7.0.15"
-redis_make_jobs: 2
-redis_clean_db: false
