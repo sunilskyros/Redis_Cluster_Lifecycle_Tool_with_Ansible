@@ -1,0 +1,1321 @@
+#!/usr/bin/env python3
+"""CLI wrapper for Redis Cluster lifecycle automation with Ansible."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, TypedDict
+
+
+
+class Runtime(TypedDict):
+    """Typed container for detected container runtime metadata."""
+    name: str
+    cmd: list[str]
+    version: str
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+ANSIBLE_DIR = PROJECT_ROOT / "ansible"
+INVENTORY = ANSIBLE_DIR / "inventory" / "hosts.ini"
+INFRA_DIR = PROJECT_ROOT / "infra"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+LOG_DIR = PROJECT_ROOT / "logs"
+SSH_DIR = INFRA_DIR / "ssh"
+SSH_KEY = SSH_DIR / "redis_cluster_key"
+AUTHORIZED_KEYS = SSH_DIR / "authorized_keys"
+REDIS_CLI_PATH = "/opt/redis/current/bin/redis-cli"
+
+MIN_ANSIBLE_VERSION = (2, 14, 0)
+
+
+class ToolError(RuntimeError):
+    """Raised for expected, user-facing command failures."""
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.groups(default="0"))
+
+
+def run_capture(cmd: list[str], cwd: Path = PROJECT_ROOT) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
+def print_missing_prereqs(messages: list[str]) -> None:
+    for message in messages:
+        print(message)
+    print()
+    print("Please install the missing dependencies and retry.")
+
+
+def detect_container_runtime(runtime_override: str | None = None) -> dict[str, object] | None:
+    target = runtime_override or os.environ.get("CONTAINER_RUNTIME", "").lower()
+    
+    if target:
+        if target == "podman":
+            if shutil.which("podman"):
+                proc = run_capture(["podman", "--version"])
+                return {"name": "podman", "cmd": ["podman"], "version": proc.stdout.strip()}
+            return None
+        if target == "docker":
+            if shutil.which("docker"):
+                proc = run_capture(["docker", "--version"])
+                return {"name": "docker", "cmd": ["docker"], "version": proc.stdout.strip()}
+            return None
+        return None
+
+    if shutil.which("podman"):
+        proc = run_capture(["podman", "--version"])
+        return {"name": "podman", "cmd": ["podman"], "version": proc.stdout.strip()}
+    if shutil.which("docker"):
+        proc = run_capture(["docker", "--version"])
+        return {"name": "docker", "cmd": ["docker"], "version": proc.stdout.strip()}
+    return None
+
+
+def detect_compose(runtime: dict[str, object]) -> list[str] | None:
+    name = runtime["name"]
+    if name == "podman":
+        if shutil.which("podman-compose"):
+            return ["podman-compose"]
+        proc = run_capture(["podman", "compose", "version"])
+        if proc.returncode == 0:
+            return ["podman", "compose"]
+        return None
+
+    proc = run_capture(["docker", "compose", "version"])
+    if proc.returncode == 0:
+        return ["docker", "compose"]
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return None
+
+
+def check_prereqs(runtime_override: str | None = None) -> dict[str, object]:
+    messages: list[str] = []
+    runtime = detect_container_runtime(runtime_override)
+    if runtime is None:
+        target = runtime_override or os.environ.get("CONTAINER_RUNTIME", "").lower()
+        if target:
+            messages.append(
+                f"MISSING Specified container runtime '{target}' not found or not installed."
+            )
+        else:
+            messages.append(
+                "MISSING Container runtime not found (Docker or Podman)\n"
+                "Install Podman: https://podman.io/docs/installation\n"
+                "Install Docker: https://docs.docker.com/engine/install/"
+            )
+
+    ansible = shutil.which("ansible-playbook")
+    ansible_version = ""
+    if not ansible:
+        messages.append(
+            "MISSING Ansible not found\n"
+            "Install: pip install ansible\n"
+            "(or use your OS package manager)"
+        )
+    else:
+        proc = run_capture([ansible, "--version"])
+        first_line = proc.stdout.splitlines()[0] if proc.stdout else ""
+        ansible_version = first_line.strip()
+        parsed = version_tuple(first_line)
+        if not parsed or parsed < MIN_ANSIBLE_VERSION:
+            messages.append(
+                "MISSING Ansible 2.14+ required\n"
+                f"Found: {ansible_version or 'unknown'}\n"
+                "Install: pip install --upgrade ansible"
+            )
+
+    if messages:
+        print_missing_prereqs(messages)
+        raise SystemExit(2)
+
+    assert runtime is not None
+    print(f"[OK] {runtime['version']} found")
+    print(f"[OK] {ansible_version} found")
+    print("Proceeding...")
+    print()
+    return {"runtime": runtime, "ansible": ansible}
+
+
+def log_event(operation: str, action: str, status: str, **extra: object) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp": now_iso(),
+        "operation": operation,
+        "action": action,
+        "status": status,
+        **extra,
+    }
+    with (LOG_DIR / f"{operation}.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+class AnsibleOutputParser:
+    """Parses Ansible stdout and prints a human-friendly summary."""
+
+    def __init__(self) -> None:
+        self.current_task = "Unknown Action"
+        self.node_actions: list[dict[str, str]] = []
+        self._capturing_json = False
+        self._json_lines: list[str] = []
+        self._brace_depth = 0
+
+    def feed(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+
+        # 1. Play/Task/Handler/Recap headers
+        play_match = re.match(r'^PLAY \[(.*?)\] \*+', line)
+        if play_match:
+            self._reset_json()
+            self.current_task = "Play: " + play_match.group(1).strip()
+            print(f"\n\033[1;36m[PLAY] {play_match.group(1).strip()}\033[0m")
+            return
+
+        task_match = re.match(r'^TASK \[(.*?)\] \*+', line)
+        if task_match:
+            self._reset_json()
+            self.current_task = task_match.group(1).strip()
+            print(f"\033[1;35m[TASK] {self.current_task}\033[0m")
+            return
+
+        handler_match = re.match(r'^RUNNING HANDLER \[(.*?)\] \*+', line)
+        if handler_match:
+            self._reset_json()
+            self.current_task = "Handler: " + handler_match.group(1).strip()
+            print(f"\033[1;35m[HANDLER] {handler_match.group(1).strip()}\033[0m")
+            return
+
+        if re.match(r'^PLAY RECAP \*+', line):
+            self._reset_json()
+            print(f"\n\033[1;36m[PLAY RECAP]\033[0m")
+            self.current_task = "Recap"
+            return
+
+        # 2. Host result lines
+        host_res_match = re.match(r'^(ok|changed|failed|fatal|skipping): \[(.*?)\]', stripped)
+        if host_res_match:
+            self._handle_host_result(host_res_match, stripped)
+            return
+
+        # 3. JSON capture for debug messages
+        if self._capturing_json:
+            self._json_lines.append(line)
+            self._brace_depth += line.count('{') - line.count('}')
+            if self._brace_depth <= 0:
+                self._flush_json()
+        elif self.current_task == "Recap":
+            print(f"  {stripped}")
+
+    def _reset_json(self) -> None:
+        self._capturing_json = False
+        self._json_lines = []
+        self._brace_depth = 0
+
+    def _handle_host_result(self, match: re.Match, stripped: str) -> None:
+        status_word = match.group(1)
+        host = match.group(2)
+
+        status_map = {
+            "ok": ("\033[32mOK\033[0m", "success"),
+            "changed": ("\033[33mCHANGED\033[0m", "success"),
+            "skipping": ("\033[37mSKIPPED\033[0m", "skipped"),
+        }
+        status_str, outcome = status_map.get(status_word, ("\033[31mFAILED\033[0m", "failed"))
+
+        print(f"  - {host}: {status_str}")
+        self.node_actions.append({
+            "timestamp": now_iso(),
+            "node": host,
+            "action": self.current_task,
+            "outcome": outcome,
+        })
+
+        if "=> {" in stripped:
+            self._capturing_json = True
+            self._json_lines.append("{")
+            self._brace_depth = 1
+
+    def _flush_json(self) -> None:
+        try:
+            data = json.loads("".join(self._json_lines))
+            msg = data.get("msg")
+            if msg:
+                if isinstance(msg, list):
+                    for m in msg:
+                        print(f"    \033[34m{m}\033[0m")
+                else:
+                    print(f"    \033[34m{msg}\033[0m")
+        except Exception:
+            pass
+        self._reset_json()
+
+
+def stream_command(
+    cmd: list[str],
+    operation: str,
+    output_file: Path | None = None,
+    cwd: Path = PROJECT_ROOT,
+    env: dict[str, str] | None = None,
+) -> int:
+    merged_env = os.environ.copy()
+    merged_env["ANSIBLE_CONFIG"] = str(ANSIBLE_DIR / "ansible.cfg")
+    merged_env["ANSIBLE_HOST_KEY_CHECKING"] = "False"
+    if env:
+        merged_env.update(env)
+
+    if output_file:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+    log_event(operation, "start", "running", command=cmd)
+
+    friendly_messages = {
+        "infra": "Managing container infrastructure...",
+        "provision": "Installing Redis and provisioning cluster...",
+        "data_seed": "Seeding deterministic key/value pairs...",
+        "data_verify": "Verifying deterministic key/value pairs...",
+        "status": "Checking Redis Cluster topology and health...",
+        "upgrade": "Upgrading Redis Cluster nodes (rolling strategy)...",
+        "verify": "Running full post-upgrade verification checks...",
+        "rollback_start": "Ensuring all Redis nodes are started...",
+        "rollback": "Rolling back upgraded nodes to previous version...",
+        "scale": "Scaling Redis Cluster...",
+    }
+    start_msg = friendly_messages.get(operation, f"Running {operation}...")
+    print(f"\033[1;34m>>> {start_msg}\033[0m")
+
+    full_output = []
+    is_ansible = cmd[0] == "ansible-playbook"
+    parser = AnsibleOutputParser() if is_ansible else None
+
+    with subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=merged_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    ) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            full_output.append(line)
+            if parser:
+                parser.feed(line)
+            elif line.strip():
+                print(line.strip())
+        rc = proc.wait()
+
+    if output_file:
+        with output_file.open("w", encoding="utf-8") as out:
+            out.write(f"$ {' '.join(cmd)}\n\n")
+            out.write("".join(full_output))
+
+    node_actions = parser.node_actions if parser else []
+    log_event(operation, "finish", "ok" if rc == 0 else "failed", return_code=rc, node_actions=node_actions)
+
+    if rc != 0:
+        print(f"\n\033[1;31m[ERROR] Command failed with exit code {rc}.\033[0m")
+        if not is_ansible:
+            print("".join(full_output))
+    else:
+        print(f"\n\033[1;32m[OK] Done.\033[0m")
+
+    return rc
+
+
+def ansible_playbook(
+    playbook: str,
+    operation: str,
+    output_name: str,
+    extra_vars: dict[str, object] | None = None,
+    limit: str | None = None,
+) -> int:
+    cmd = [
+        "ansible-playbook",
+        "-i",
+        str(INVENTORY),
+        str(ANSIBLE_DIR / "playbooks" / playbook),
+    ]
+    if limit:
+        cmd.extend(["--limit", limit])
+    if extra_vars:
+        for key, value in extra_vars.items():
+            cmd.extend(["-e", f"{key}={value}"])
+    return stream_command(cmd, operation, OUTPUT_DIR / output_name)
+
+
+def ensure_ssh_key() -> None:
+    SSH_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_DIR.chmod(0o700)
+    if not SSH_KEY.exists():
+        if not shutil.which("ssh-keygen"):
+            raise ToolError("ssh-keygen is required to create the local container SSH key.")
+        rc = stream_command(
+            [
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-f",
+                str(SSH_KEY),
+                "-N",
+                "",
+                "-C",
+                "redis-cluster-lifecycle-tool",
+            ],
+            "infra",
+            OUTPUT_DIR / "infra_key_output.txt",
+        )
+        if rc != 0:
+            raise SystemExit(rc)
+        SSH_KEY.chmod(0o600)
+
+    public_key = SSH_KEY.with_suffix(SSH_KEY.suffix + ".pub")
+    AUTHORIZED_KEYS.write_text(public_key.read_text(encoding="utf-8"), encoding="utf-8")
+    AUTHORIZED_KEYS.chmod(0o644)
+
+
+def ensure_podman_socket() -> bool:
+    """Try to enable and start the Podman user socket. Returns True if socket is (now) active."""
+    # Check if the socket is already active
+    check = run_capture(["systemctl", "--user", "is-active", "podman.socket"])
+    if check.returncode == 0 and check.stdout.strip() == "active":
+        return True
+
+    print("\033[1;33m[INFO] Podman socket is not running. Attempting to start it automatically...\033[0m")
+    enable_proc = run_capture(["systemctl", "--user", "enable", "--now", "podman.socket"])
+    if enable_proc.returncode != 0:
+        print("\033[1;31m[WARN] Failed to enable/start podman.socket automatically.\033[0m")
+        print("       Please run manually:")
+        print("         systemctl --user enable --now podman.socket")
+        return False
+
+    # Verify it came up
+    verify = run_capture(["systemctl", "--user", "is-active", "podman.socket"])
+    if verify.returncode == 0 and verify.stdout.strip() == "active":
+        print("\033[1;32m[OK] Podman socket started successfully.\033[0m")
+        return True
+
+    print("\033[1;31m[WARN] Podman socket still not active after enable attempt.\033[0m")
+    return False
+
+
+def compose_command(runtime: dict[str, object], action: str, services: list[str] | None = None) -> list[str]:
+    compose = detect_compose(runtime)
+    if compose is None:
+        raise ToolError(
+            "Compose support not found for the selected runtime.\n"
+            "Install podman-compose for Podman or Docker Compose for Docker."
+        )
+
+    base = compose + ["-f", str(INFRA_DIR / "compose.yml")]
+    if action == "up":
+        cmd = base + ["up", "-d", "--build"]
+        if services:
+            cmd.extend(services)
+        return cmd
+    if action == "down":
+        return base + ["down"]
+    raise ToolError(f"Unknown compose action: {action}")
+
+
+def cmd_infra(args: argparse.Namespace, context: dict[str, object]) -> int:
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+
+    # Auto-start the Podman socket if needed before any infra operation
+    if runtime["name"] == "podman":
+        ensure_podman_socket()
+
+    if args.infra_action == "up":
+        resolve_port_conflicts(context)
+        ensure_ssh_key()
+        df = INFRA_DIR / "Dockerfile"
+        cf = INFRA_DIR / "Containerfile"
+        if df.exists() and not cf.exists():
+            shutil.copy2(df, cf)
+        elif cf.exists() and not df.exists():
+            shutil.copy2(cf, df)
+    cmd = compose_command(runtime, args.infra_action)
+    rc = stream_command(
+        cmd,
+        "infra",
+        OUTPUT_DIR / f"infra_{args.infra_action}_output.txt",
+        cwd=INFRA_DIR,
+    )
+    if rc != 0:
+        print("\n\033[1;31m[ERROR] Infrastructure command failed.\033[0m")
+        if runtime["name"] == "podman":
+            print("\033[1;33mHint for Podman users:\033[0m")
+            print("  If you encounter connection errors to 'podman.sock' (e.g. no such file or directory),")
+            print("  ensure that the Podman systemd socket service is running:")
+            print("    systemctl --user enable --now podman.socket")
+            print("  Alternatively, if you prefer to use Docker instead, you can run the tool with:")
+            print("    --runtime docker   (or set CONTAINER_RUNTIME=docker environment variable)")
+        elif runtime["name"] == "docker":
+            print("\033[1;33mHint for Docker users:\033[0m")
+            print("  Ensure that the Docker daemon is running (e.g., systemctl start docker or docker-desktop).")
+            print("  If you have Podman installed but want to force Docker, run the tool with:")
+            print("    --runtime docker   (or set CONTAINER_RUNTIME=docker environment variable)")
+        print()
+    return rc
+
+
+def parse_inventory() -> list[dict[str, str]]:
+    nodes = []
+    if not INVENTORY.exists():
+        return nodes
+    with INVENTORY.open("r", encoding="utf-8") as f:
+        in_redis_nodes = False
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            if line.startswith("["):
+                if line == "[redis_nodes]":
+                    in_redis_nodes = True
+                else:
+                    in_redis_nodes = False
+                continue
+            if in_redis_nodes:
+                if line.startswith("redis-node-"):
+                    parts = line.split()
+                    node_name = parts[0]
+                    node_vars = {}
+                    for p in parts[1:]:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            node_vars[k] = v
+                    nodes.append({
+                        "name": node_name,
+                        "ip": node_vars.get("redis_cluster_ip"),
+                        "ansible_port": node_vars.get("ansible_port"),
+                        "role": node_vars.get("redis_initial_role"),
+                        "replica_of": node_vars.get("redis_replica_of"),
+                    })
+    return nodes
+
+
+def run_container_cmd(node_name: str, cmd: list[str], context: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    full_cmd = runtime["cmd"] + ["exec", node_name] + cmd
+    return run_capture(full_cmd)
+
+
+def parse_cluster_nodes(context: dict[str, object]) -> list[dict[str, object]]:
+    nodes = parse_inventory()
+    if not nodes:
+        raise ToolError("No nodes found in inventory")
+    first_node = nodes[0]["name"]
+    res = run_container_cmd(first_node, [REDIS_CLI_PATH, "-p", "6379", "CLUSTER", "NODES"], context)
+    if res.returncode != 0:
+        raise ToolError(f"Failed to get CLUSTER NODES: {res.stdout}")
+    
+    parsed = []
+    for line in res.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        node_id = parts[0]
+        addr = parts[1].split("@")[0]
+        ip, port = addr.split(":")
+        flags = parts[2].split(",")
+        role = "master" if "master" in flags else "replica" if "slave" in flags else "unknown"
+        master_id = parts[3] if parts[3] != "-" else None
+        link_state = parts[7]
+        
+        slots = []
+        if role == "master" and len(parts) >= 9:
+            for s in parts[8:]:
+                if "-" in s:
+                    start, end = s.split("-")
+                    slots.extend(range(int(start), int(end) + 1))
+                else:
+                    slots.append(int(s))
+                    
+        parsed.append({
+            "id": node_id,
+            "ip": ip,
+            "port": int(port),
+            "role": role,
+            "master_id": master_id,
+            "link_state": link_state,
+            "slots": slots,
+        })
+    return parsed
+
+
+def is_port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except socket.error:
+            return True
+
+
+def find_free_port(start_port: int, exclude_ports: set[int]) -> int:
+    port = start_port
+    while True:
+        if port not in exclude_ports:
+            if not is_port_in_use(port):
+                return port
+        port += 1
+
+
+def get_running_container_port(compose: list[str], service_name: str) -> int | None:
+    cmd = compose + ["-f", str(INFRA_DIR / "compose.yml"), "port", service_name, "22"]
+    proc = run_capture(cmd)
+    if proc.returncode == 0 and proc.stdout.strip():
+        out = proc.stdout.strip()
+        if ":" in out:
+            port_str = out.split(":")[-1]
+        else:
+            port_str = out
+        try:
+            return int(port_str)
+        except ValueError:
+            return None
+    return None
+
+
+def update_ports_in_config_files(new_ports: dict[str, int]) -> None:
+    # 1. Update compose.yml
+    compose_path = INFRA_DIR / "compose.yml"
+    if compose_path.exists():
+        content = compose_path.read_text(encoding="utf-8")
+        for node_name, port in new_ports.items():
+            pattern = r"(  " + re.escape(node_name) + r":\s*\n(?:[^\n]*\n)*?\s*ports:\s*\n\s*-\s*\")(\d+)(:22\")"
+            content = re.sub(pattern, rf"\g<1>{port}\g<3>", content)
+        compose_path.write_text(content, encoding="utf-8")
+
+    # 2. Update hosts.ini
+    if INVENTORY.exists():
+        content = INVENTORY.read_text(encoding="utf-8")
+        for node_name, port in new_ports.items():
+            pattern = r"(\b" + re.escape(node_name) + r"\b.*?ansible_port=)\d+"
+            content = re.sub(pattern, rf"\g<1>{port}", content)
+        INVENTORY.write_text(content, encoding="utf-8")
+
+
+def resolve_port_conflicts(context: dict[str, object]) -> None:
+    nodes = parse_inventory()
+    if not nodes:
+        return
+
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    compose = detect_compose(runtime)
+    if not compose:
+        return
+
+    allocated_ports = set()
+    changed = False
+    new_ports = {}
+
+    for node in nodes:
+        node_name = node["name"]
+        current_port_str = node["ansible_port"]
+        if not current_port_str:
+            continue
+        current_port = int(current_port_str)
+        
+        # Check if the container is already running and mapping this port
+        running_port = get_running_container_port(compose, node_name)
+        if running_port == current_port:
+            allocated_ports.add(current_port)
+            new_ports[node_name] = current_port
+        else:
+            if current_port in allocated_ports or is_port_in_use(current_port):
+                free_port = find_free_port(2221, allocated_ports)
+                print(f"[INFO] Port conflict detected for {node_name} on port {current_port}. Reassigning to free port {free_port}.")
+                allocated_ports.add(free_port)
+                new_ports[node_name] = free_port
+                changed = True
+            else:
+                allocated_ports.add(current_port)
+                new_ports[node_name] = current_port
+
+    if changed:
+        update_ports_in_config_files(new_ports)
+
+
+def add_nodes_to_compose(count: int, context: dict[str, object]) -> list[dict[str, object]]:
+    compose_path = INFRA_DIR / "compose.yml"
+    content = compose_path.read_text(encoding="utf-8")
+    
+    node_numbers = [int(n) for n in re.findall(r"redis-node-(\d+):", content)]
+    max_node = max(node_numbers) if node_numbers else 6
+    
+    # Find currently allocated ports
+    allocated_ports = set()
+    for n in parse_inventory():
+        if n.get("ansible_port"):
+            allocated_ports.add(int(n["ansible_port"]))
+
+    new_nodes = []
+    new_services_str = ""
+    for i in range(1, count + 1):
+        num = max_node + i
+        ip_last_octet = 10 + num
+        ssh_port = find_free_port(2220 + num, allocated_ports)
+        allocated_ports.add(ssh_port)
+        node_name = f"redis-node-{num}"
+        new_nodes.append({
+            "name": node_name,
+            "port": ssh_port,
+            "ip": f"10.10.0.{ip_last_octet}"
+        })
+        
+        service_template = f"""
+  {node_name}:
+    image: redis-node-base:latest
+    container_name: {node_name}
+    hostname: {node_name}
+    ports:
+      - "{ssh_port}:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.{ip_last_octet}
+"""
+        new_services_str += service_template
+        
+    parts = re.split(r"^networks:", content, flags=re.MULTILINE)
+    if len(parts) == 2:
+        new_content = parts[0].rstrip() + "\n" + new_services_str + "\nnetworks:" + parts[1]
+        compose_path.write_text(new_content, encoding="utf-8")
+    else:
+        raise ToolError("Failed to parse compose.yml networks block")
+        
+    return new_nodes
+
+
+def remove_nodes_from_compose(node_names: list[str]) -> None:
+    compose_path = INFRA_DIR / "compose.yml"
+    content = compose_path.read_text(encoding="utf-8")
+    for name in node_names:
+        pattern = r"\n  " + re.escape(name) + r":\n(    .*\n| *\n)*"
+        content = re.sub(pattern, "\n", content)
+    compose_path.write_text(content, encoding="utf-8")
+
+
+def add_nodes_to_inventory(new_nodes: list[dict[str, object]]) -> None:
+    content = INVENTORY.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    new_lines = []
+    
+    master_node_info = new_nodes[0]
+    replica_node_info = new_nodes[1]
+    
+    master_node = master_node_info["name"]
+    replica_node = replica_node_info["name"]
+    
+    m_port = master_node_info["port"]
+    r_port = replica_node_info["port"]
+    
+    m_ip = master_node_info["ip"]
+    r_ip = replica_node_info["ip"]
+    
+    m_line = f"{master_node} ansible_host=127.0.0.1 ansible_port={m_port} redis_cluster_ip={m_ip} redis_initial_role=master"
+    r_line = f"{replica_node} ansible_host=127.0.0.1 ansible_port={r_port} redis_cluster_ip={r_ip} redis_initial_role=replica redis_replica_of={master_node}"
+    
+    in_redis_nodes = False
+    in_masters = False
+    in_replicas = False
+    
+    for line in lines:
+        if line.strip() == "[redis_nodes]":
+            in_redis_nodes = True
+            new_lines.append(line)
+            continue
+        elif line.strip() == "[redis_masters_initial]":
+            if in_redis_nodes:
+                new_lines.append(m_line)
+                new_lines.append(r_line)
+                new_lines.append("")
+                in_redis_nodes = False
+            in_masters = True
+            new_lines.append(line)
+            continue
+        elif line.strip() == "[redis_replicas_initial]":
+            if in_masters:
+                new_lines.append(master_node)
+                new_lines.append("")
+                in_masters = False
+            in_replicas = True
+            new_lines.append(line)
+            continue
+        elif line.strip() == "[redis_nodes:vars]":
+            if in_replicas:
+                new_lines.append(replica_node)
+                new_lines.append("")
+                in_replicas = False
+            new_lines.append(line)
+            continue
+            
+        new_lines.append(line)
+        
+    INVENTORY.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def remove_nodes_from_inventory(node_names: list[str]) -> None:
+    content = INVENTORY.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(name) for name in node_names):
+            continue
+        new_lines.append(line)
+    INVENTORY.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def scale_out(count: int, context: dict[str, object]) -> int:
+    print(f"Scaling out: adding {count} nodes (1 master + 1 replica)...")
+    
+    existing_nodes = parse_inventory()
+    if not existing_nodes:
+        raise ToolError("Failed to parse existing inventory.")
+        
+    masters = [n for n in existing_nodes if n["role"] == "master"]
+    replicas = [n for n in existing_nodes if n["role"] == "replica"]
+    print(f"Current topology has {len(masters)} masters and {len(replicas)} replicas.")
+    
+    version = "7.0.15"
+    try:
+        first_node = existing_nodes[0]["name"]
+        res = run_container_cmd(first_node, [REDIS_CLI_PATH, "-p", "6379", "INFO", "server"], context)
+        if res.returncode == 0:
+            v_match = re.search(r'redis_version:(.*)', res.stdout)
+            if v_match:
+                version = v_match.group(1).strip()
+    except Exception as e:
+        print(f"Warning: could not detect running Redis version, defaulting to {version}. Error: {e}")
+        
+    print(f"Detected running cluster version: {version}")
+
+    new_nodes_info = add_nodes_to_compose(count, context)
+    new_node_names = [n["name"] for n in new_nodes_info]
+    print(f"Added new nodes to compose.yml: {', '.join(new_node_names)}")
+
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    cmd = compose_command(runtime, "up", new_node_names)
+    rc = stream_command(
+        cmd,
+        "infra",
+        OUTPUT_DIR / "infra_scale_up_output.txt",
+        cwd=INFRA_DIR,
+    )
+    if rc != 0:
+        raise ToolError(f"Failed to start new infrastructure containers (rc={rc}).")
+        
+    print("Waiting for containers to boot SSH services...")
+    time.sleep(5)
+
+    add_nodes_to_inventory(new_nodes_info)
+    print("Added new nodes to hosts.ini.")
+
+    new_masters_count = len(masters) + (count // 2)
+    replicas_per_master = 1
+    
+    print("Installing and starting Redis on new nodes...")
+    rc = ansible_playbook(
+        "scale_provision.yml",
+        "scale",
+        "scale_provision_output.txt",
+        {
+            "redis_version": version,
+        },
+        limit=",".join(new_node_names)
+    )
+    if rc != 0:
+        raise ToolError(f"Failed to provision new nodes (rc={rc}).")
+
+    updated_nodes = parse_inventory()
+    master_node_info = next(n for n in updated_nodes if n["name"] == new_node_names[0])
+    replica_node_info = next(n for n in updated_nodes if n["name"] == new_node_names[1])
+    
+    first_node = existing_nodes[0]["name"]
+    first_node_ip = existing_nodes[0]["ip"]
+    
+    print(f"Adding new master {master_node_info['name']} ({master_node_info['ip']}:6379) to cluster...")
+    res = run_container_cmd(
+        first_node,
+        [REDIS_CLI_PATH, "--cluster", "add-node", f"{master_node_info['ip']}:6379", f"{first_node_ip}:6379"],
+        context
+    )
+    if res.returncode != 0:
+        raise ToolError(f"Failed to add new master to cluster: {res.stdout}")
+        
+    print("Waiting for cluster to register the new master...")
+    time.sleep(5)
+    
+    cluster_nodes = parse_cluster_nodes(context)
+    new_master_id = None
+    for n in cluster_nodes:
+        if n["ip"] == master_node_info["ip"]:
+            new_master_id = n["id"]
+            break
+            
+    if not new_master_id:
+        raise ToolError(f"Could not find node ID for new master at {master_node_info['ip']}")
+        
+    print(f"New master node ID: {new_master_id}")
+    
+    print(f"Adding new replica {replica_node_info['name']} ({replica_node_info['ip']}:6379) to cluster...")
+    res = run_container_cmd(
+        first_node,
+        [
+            REDIS_CLI_PATH,
+            "--cluster", "add-node",
+            f"{replica_node_info['ip']}:6379",
+            f"{first_node_ip}:6379",
+            "--cluster-slave",
+            "--cluster-master-id", new_master_id
+        ],
+        context
+    )
+    if res.returncode != 0:
+        raise ToolError(f"Failed to add new replica to cluster: {res.stdout}")
+        
+    print("Waiting for new replica to join and synchronize...")
+    time.sleep(5)
+    
+    print("Rebalancing slots across all masters...")
+    res = run_container_cmd(
+        first_node,
+        [REDIS_CLI_PATH, "--cluster", "rebalance", f"{first_node_ip}:6379", "--cluster-use-empty-masters"],
+        context
+    )
+    if res.returncode != 0:
+        raise ToolError(f"Failed to rebalance slots: {res.stdout}")
+        
+    print("Scale out complete!")
+    return 0
+
+
+def scale_in(node_id: str, context: dict[str, object]) -> int:
+    print(f"Scaling in: removing node {node_id} and its counterpart...")
+    
+    cluster_nodes = parse_cluster_nodes(context)
+    inventory = parse_inventory()
+    
+    resolved_id = None
+    
+    # 1. Match by digit index or node name
+    target_name = node_id
+    if node_id.isdigit():
+        target_name = f"redis-node-{node_id}"
+        
+    inv_node = next((n for n in inventory if n["name"] == target_name), None)
+    if inv_node:
+        node_in_cluster = next((n for n in cluster_nodes if n["ip"] == inv_node["ip"]), None)
+        if node_in_cluster:
+            resolved_id = node_in_cluster["id"]
+            
+    # 2. Match by Node ID prefix
+    if not resolved_id:
+        matching_nodes = [n for n in cluster_nodes if n["id"].startswith(node_id)]
+        if len(matching_nodes) == 1:
+            resolved_id = matching_nodes[0]["id"]
+        elif len(matching_nodes) > 1:
+            raise ToolError(f"Node ID prefix '{node_id}' is ambiguous. Matches multiple nodes: {', '.join(n['id'] for n in matching_nodes)}")
+            
+    # 3. Match by exact ID
+    if not resolved_id:
+        target_node = next((n for n in cluster_nodes if n["id"] == node_id), None)
+        if target_node:
+            resolved_id = target_node["id"]
+            
+    if not resolved_id:
+        raise ToolError(f"Node '{node_id}' not found in the cluster topology or inventory.")
+        
+    node_id = resolved_id
+    target_node = next((n for n in cluster_nodes if n["id"] == node_id), None)
+    assert target_node is not None
+    
+    print(f"Found node {node_id} with role '{target_node['role']}' at {target_node['ip']}:{target_node['port']}")
+    
+    if target_node["role"] == "master":
+        master_node = target_node
+        replica_node = next((n for n in cluster_nodes if n["master_id"] == master_node["id"]), None)
+        if not replica_node:
+            print("Warning: no replica found for this master in the cluster.")
+    else:
+        replica_node = target_node
+        master_node = next((n for n in cluster_nodes if n["id"] == replica_node["master_id"]), None)
+        if not master_node:
+            raise ToolError(f"Master node {replica_node['master_id']} not found for replica {replica_node['id']}.")
+            
+    print(f"Master to remove: {master_node['id']} at {master_node['ip']}")
+    if replica_node:
+        print(f"Replica to remove: {replica_node['id']} at {replica_node['ip']}")
+        
+    all_masters = [n for n in cluster_nodes if n["role"] == "master"]
+    if len(all_masters) <= 3:
+        raise ToolError(f"Cannot scale in: cluster has only {len(all_masters)} masters. A minimum of 3 masters is required.")
+        
+    active_node = next(n for n in cluster_nodes if n["id"] not in (master_node["id"], (replica_node["id"] if replica_node else None)))
+    
+    inventory = parse_inventory()
+    active_node_inv = next(n for n in inventory if n["ip"] == active_node["ip"])
+    active_container = active_node_inv["name"]
+    
+    if len(master_node["slots"]) > 0:
+        target_master = next(n for n in all_masters if n["id"] != master_node["id"])
+        print(f"Migrating {len(master_node['slots'])} slots from {master_node['id']} to {target_master['id']} ({target_master['ip']})...")
+        
+        res = run_container_cmd(
+            active_container,
+            [
+                REDIS_CLI_PATH,
+                "--cluster", "reshard", f"{active_node['ip']}:6379",
+                "--cluster-from", master_node["id"],
+                "--cluster-to", target_master["id"],
+                "--cluster-slots", str(len(master_node["slots"])),
+                "--cluster-yes"
+            ],
+            context
+        )
+        if res.returncode != 0:
+            raise ToolError(f"Failed to reshard slots off the master: {res.stdout}")
+        print("Slots migrated successfully.")
+        
+    if replica_node:
+        print(f"Removing replica node {replica_node['id']} from cluster...")
+        res = run_container_cmd(
+            active_container,
+            [
+                REDIS_CLI_PATH,
+                "--cluster", "del-node", f"{active_node['ip']}:6379",
+                replica_node["id"]
+            ],
+            context
+        )
+        if res.returncode != 0:
+            print(f"Warning: failed to delete replica node from cluster: {res.stdout}")
+            
+    print(f"Removing master node {master_node['id']} from cluster...")
+    res = run_container_cmd(
+        active_container,
+        [
+            REDIS_CLI_PATH,
+            "--cluster", "del-node", f"{active_node['ip']}:6379",
+            master_node["id"]
+        ],
+        context
+    )
+    if res.returncode != 0:
+        raise ToolError(f"Failed to delete master node from cluster: {res.stdout}")
+        
+    removed_names = []
+    m_inv = next((n for n in inventory if n["ip"] == master_node["ip"]), None)
+    if m_inv:
+        removed_names.append(m_inv["name"])
+    if replica_node:
+        r_inv = next((n for n in inventory if n["ip"] == replica_node["ip"]), None)
+        if r_inv:
+            removed_names.append(r_inv["name"])
+            
+    print(f"Containers to stop and remove: {', '.join(removed_names)}")
+    
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    for name in removed_names:
+        print(f"Stopping container {name}...")
+        run_capture(runtime["cmd"] + ["stop", name])
+        print(f"Removing container {name}...")
+        run_capture(runtime["cmd"] + ["rm", name])
+        
+    remove_nodes_from_compose(removed_names)
+    remove_nodes_from_inventory(removed_names)
+    print("Updated compose.yml and hosts.ini to remove the nodes.")
+    
+    print("Scale in complete!")
+    return 0
+
+
+def cmd_scale(args: argparse.Namespace, context: dict[str, object]) -> int:
+    if args.add_nodes:
+        return scale_out(args.add_nodes, context)
+    elif args.remove_node:
+        return scale_in(args.remove_node, context)
+    else:
+        raise ToolError("Invalid scale arguments")
+
+
+def check_all_nodes_version(target_version: str, context: dict[str, object]) -> bool:
+    """Return True if all cluster nodes are already running the specified version."""
+    try:
+        if not is_infra_running(context):
+            return False
+        nodes = parse_cluster_nodes(context)
+        if not nodes:
+            return False
+        inventory_nodes = parse_inventory()
+        if not inventory_nodes:
+            return False
+        first_container = inventory_nodes[0]["name"]
+        for node in nodes:
+            res = run_container_cmd(
+                first_container,
+                [REDIS_CLI_PATH, "-h", node["ip"], "-p", "6379", "INFO", "server"],
+                context,
+            )
+            if res.returncode != 0:
+                return False
+            v_match = re.search(r'redis_version:(.*)', res.stdout)
+            if not v_match or v_match.group(1).strip() != target_version:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def cmd_provision(args: argparse.Namespace, context: dict[str, object]) -> int:
+    if check_all_nodes_version(args.version, context):
+        first_container = parse_inventory()[0]["name"]
+        res_info = run_container_cmd(
+            first_container,
+            [REDIS_CLI_PATH, "-p", "6379", "CLUSTER", "INFO"],
+            context,
+        )
+        if "cluster_state:ok" in res_info.stdout:
+            print(f"Cluster is already provisioned and healthy with Redis {args.version}. No action required.")
+            return 0
+
+    return ansible_playbook(
+        "provision.yml",
+        "provision",
+        "provision_output.txt",
+        {
+            "redis_version": args.version,
+            "cluster_masters_count": args.masters,
+            "replicas_per_master": args.replicas_per_master,
+        },
+    )
+
+
+def get_keys_count(args: argparse.Namespace) -> int:
+    keys = args.keys
+    if keys is None:
+        try:
+            keys = int((OUTPUT_DIR / ".last_seeded_keys").read_text(encoding="utf-8").strip())
+        except Exception:
+            keys = 1000
+    return keys
+
+
+def cmd_data_seed(args: argparse.Namespace, _context: dict[str, object]) -> int:
+    keys = args.keys if args.keys is not None else 1000
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / ".last_seeded_keys").write_text(str(keys), encoding="utf-8")
+    except Exception:
+        pass
+    return ansible_playbook(
+        "data_seed.yml",
+        "data_seed",
+        "data_seed_output.txt",
+        {"keys_count": keys},
+    )
+
+
+def cmd_data_verify(args: argparse.Namespace, _context: dict[str, object]) -> int:
+    keys = get_keys_count(args)
+    return ansible_playbook(
+        "data_verify.yml",
+        "data_verify",
+        "data_verify_output.txt",
+        {"keys_count": keys},
+    )
+
+
+def cmd_status(_args: argparse.Namespace, _context: dict[str, object]) -> int:
+    return ansible_playbook("status.yml", "status", "status_output.txt")
+
+
+def cmd_upgrade(args: argparse.Namespace, context: dict[str, object]) -> int:
+    if args.strategy != "rolling":
+        raise ToolError("Only --strategy rolling is implemented.")
+
+    if check_all_nodes_version(args.target_version, context):
+        print(f"All nodes are already running Redis {args.target_version}. No upgrade required.")
+        return 0
+
+    keys = get_keys_count(args)
+    return ansible_playbook(
+        "upgrade.yml",
+        "upgrade",
+        "upgrade_output.txt",
+        {"target_version": args.target_version, "keys_count": keys},
+    )
+
+
+def cmd_rollback(args: argparse.Namespace, _context: dict[str, object]) -> int:
+    keys = get_keys_count(args)
+    rc = ansible_playbook(
+        "rollback.yml",
+        "rollback",
+        "rollback_output.txt",
+        {"target_version": args.target_version},
+    )
+    if rc != 0:
+        raise ToolError(f"Rollback failed (rc={rc}).")
+        
+    print("Re-seeding data after rollback...")
+    rc_seed = ansible_playbook(
+        "data_seed.yml",
+        "data_seed",
+        "rollback_seed_output.txt",
+        {"keys_count": keys},
+    )
+    return rc_seed
+
+
+def cmd_verify(args: argparse.Namespace, _context: dict[str, object]) -> int:
+    if not args.full:
+        raise ToolError("Use --full for the comprehensive verification check.")
+    keys = get_keys_count(args)
+    return ansible_playbook(
+        "verify_full.yml",
+        "verify",
+        "verify_output.txt",
+        {"keys_count": keys},
+    )
+
+
+def add_common_key_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--keys", type=int, default=None, help="Number of deterministic keys (default: last seeded count, or 1000)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="redis-tool",
+        description="Provision, operate, verify, and upgrade a six-node Redis Cluster with Ansible.",
+    )
+    parser.add_argument(
+        "--runtime",
+        choices=["docker", "podman"],
+        help="Force container runtime (docker or podman). Overrides auto-detection.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    infra = subparsers.add_parser("infra", help="Manage the local SSH container infrastructure")
+    infra_sub = infra.add_subparsers(dest="infra_action", required=True)
+    infra_sub.add_parser("up", help="Create SSH key, build images, and start containers").set_defaults(func=cmd_infra)
+    infra_sub.add_parser("down", help="Stop and remove containers").set_defaults(func=cmd_infra)
+
+    provision = subparsers.add_parser("provision", help="Install Redis and form the cluster")
+    provision.add_argument("--version", required=True, help="Exact Redis version to install, for example 7.0.15")
+    provision.add_argument("--masters", type=int, required=True, help="Number of Redis masters")
+    provision.add_argument("--replicas-per-master", type=int, required=True, help="Replica count per master")
+    provision.set_defaults(func=cmd_provision)
+
+    data = subparsers.add_parser("data", help="Seed or verify deterministic test data")
+    data_sub = data.add_subparsers(dest="data_action", required=True)
+    seed = data_sub.add_parser("seed", help="Seed deterministic key/value pairs")
+    add_common_key_arg(seed)
+    seed.set_defaults(func=cmd_data_seed)
+    verify = data_sub.add_parser("verify", help="Verify deterministic key/value pairs")
+    add_common_key_arg(verify)
+    verify.set_defaults(func=cmd_data_verify)
+
+    status = subparsers.add_parser("status", help="Print Redis Cluster topology and health")
+    status.set_defaults(func=cmd_status)
+
+    upgrade = subparsers.add_parser("upgrade", help="Perform a zero-downtime rolling Redis upgrade")
+    upgrade.add_argument("--target-version", required=True, help="Exact Redis version to upgrade to")
+    upgrade.add_argument("--strategy", default="rolling", choices=["rolling"], help="Upgrade strategy")
+    add_common_key_arg(upgrade)
+    upgrade.set_defaults(func=cmd_upgrade)
+
+    verify_full = subparsers.add_parser("verify", help="Run full post-upgrade verification")
+    verify_full.add_argument("--full", action="store_true", required=True, help="Run all verification checks")
+    add_common_key_arg(verify_full)
+    verify_full.set_defaults(func=cmd_verify)
+
+    rollback = subparsers.add_parser("rollback", help="Roll back upgraded nodes to a previous version")
+    rollback.add_argument("--target-version", required=True, help="Target version to roll back to")
+    add_common_key_arg(rollback)
+    rollback.set_defaults(func=cmd_rollback)
+
+    scale = subparsers.add_parser("scale", help="Scale the Redis Cluster out or in")
+    scale_group = scale.add_mutually_exclusive_group(required=True)
+    scale_group.add_argument("--add-nodes", type=int, choices=[2], help="Add a new master + replica pair (must be 2)")
+    scale_group.add_argument("--remove-node", type=str, help="Node ID of the master (or replica) to remove")
+    scale.set_defaults(func=cmd_scale)
+
+    return parser
+
+
+def is_infra_running(context: dict[str, object]) -> bool:
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    cmd = runtime["cmd"]
+    proc = run_capture(cmd + [
+        "ps",
+        "--filter", "label=com.docker.compose.project=infra",
+        "--filter", "status=running",
+        "-q"
+    ])
+    if proc.returncode != 0:
+        return False
+    running = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    expected = len(parse_inventory())
+    return len(running) >= expected and expected > 0
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        context = check_prereqs(runtime_override=getattr(args, "runtime", None))
+        if args.command in ("provision", "data", "status", "upgrade", "verify", "scale", "rollback"):
+            if not is_infra_running(context):
+                infra_args = argparse.Namespace(infra_action="up")
+                rc = cmd_infra(infra_args, context)
+                if rc != 0:
+                    return rc
+                time.sleep(2)
+        return args.func(args, context)
+    except ToolError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

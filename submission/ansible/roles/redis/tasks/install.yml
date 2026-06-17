@@ -1,0 +1,59 @@
+- name: Ensure Redis install root exists
+  ansible.builtin.file:
+    path: "{{ redis_install_prefix }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Check requested Redis binary
+  ansible.builtin.stat:
+    path: "{{ redis_install_prefix }}/{{ redis_version }}/bin/redis-server"
+  register: redis_binary
+
+- name: Download Redis source
+  ansible.builtin.get_url:
+    url: "{{ redis_source_url }}"
+    dest: "/tmp/redis-{{ redis_version }}.tar.gz"
+    mode: "0644"
+    timeout: 45
+  become: true
+  register: download_result
+  until: download_result is success
+  retries: 3
+  delay: 5
+  when: not redis_binary.stat.exists
+
+- name: Extract Redis source
+  ansible.builtin.unarchive:
+    src: "/tmp/redis-{{ redis_version }}.tar.gz"
+    dest: "{{ redis_build_root }}"
+    remote_src: true
+    creates: "{{ redis_build_root }}/redis-{{ redis_version }}"
+  become: true
+  when: not redis_binary.stat.exists
+
+- name: Build Redis from source
+  ansible.builtin.command: "make -j{{ redis_make_jobs }} MALLOC=libc"
+  args:
+    chdir: "{{ redis_build_root }}/redis-{{ redis_version }}"
+    creates: "{{ redis_build_root }}/redis-{{ redis_version }}/src/redis-server"
+  become: true
+  when: not redis_binary.stat.exists
+
+- name: Install Redis under versioned prefix
+  ansible.builtin.command: "make install PREFIX={{ redis_install_prefix }}/{{ redis_version }}"
+  args:
+    chdir: "{{ redis_build_root }}/redis-{{ redis_version }}"
+    creates: "{{ redis_install_prefix }}/{{ redis_version }}/bin/redis-server"
+  become: true
+  when: not redis_binary.stat.exists
+
+- name: Point current Redis symlink at requested version
+  ansible.builtin.file:
+    src: "{{ redis_install_prefix }}/{{ redis_version }}"
+    dest: "{{ redis_current_symlink }}"
+    state: link
+    force: true
+  become: true

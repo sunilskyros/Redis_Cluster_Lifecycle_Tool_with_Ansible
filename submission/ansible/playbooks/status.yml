@@ -1,0 +1,59 @@
+- name: Print Redis Cluster status
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Render readable cluster status
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cli="{{ redis_current_symlink }}/bin/redis-cli"
+        nodes_file="$(mktemp)"
+        "$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES > "$nodes_file"
+        state=$("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER INFO | awk -F: '/cluster_state/ { gsub(/\r/, "", $2); print $2 }')
+
+        print_node_info() {
+          addr="$1"
+          role="$2"
+          slots="$3"
+          master_id="$4"
+          link="$5"
+          host="${addr%:*}"
+          port="${addr#*:}"
+          version=$("$cli" -h "$host" -p "$port" --raw INFO server | awk -F: '/redis_version/ { gsub(/\r/, "", $2); print $2 }')
+          memory=$("$cli" -h "$host" -p "$port" --raw INFO memory | awk -F: '/used_memory_human/ { gsub(/\r/, "", $2); print $2 }')
+          if [ "$role" = "master" ]; then
+            keys=$("$cli" -h "$host" -p "$port" DBSIZE)
+            printf "%-18s [master]  v%-8s slots: %-13s keys: %-5s mem: %-7s link:%s\n" "$addr" "$version" "$slots" "$keys" "$memory" "$link"
+          else
+            master_addr=$(awk -v mid="$master_id" '$1 == mid { split($2, a, "@"); print a[1] }' "$nodes_file")
+            printf "%-18s [replica] v%-8s replicating: %-18s mem: %-7s link:%s\n" "$addr" "$version" "$master_addr" "$memory" "$link"
+          fi
+        }
+
+        echo "Cluster State: ${state}"
+        echo
+        echo "MASTERS"
+        awk '$3 ~ /master/ && $3 !~ /fail/ { split($2, a, "@"); slots=""; for (i=9; i<=NF; i++) slots=slots $i " "; print a[1] "|" slots "|" $8 }' "$nodes_file" \
+          | while IFS='|' read -r addr slots link; do
+              print_node_info "$addr" "master" "${slots:-none}" "-" "$link"
+            done
+        echo
+        echo "REPLICAS"
+        awk '$3 ~ /slave|replica/ && $3 !~ /fail/ { split($2, a, "@"); print a[1] "|" $4 "|" $8 }' "$nodes_file" \
+          | while IFS='|' read -r addr master_id link; do
+              print_node_info "$addr" "replica" "-" "$master_id" "$link"
+            done
+        rm -f "$nodes_file"
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ first_node }}"
+      register: status_result
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        msg: "{{ status_result.stdout_lines }}"

@@ -1,0 +1,94 @@
+- name: Full Redis Cluster verification
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Verify data integrity
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
+
+    - name: Data integrity result
+      ansible.builtin.debug:
+        msg: "{{ data_verify_result.stdout_lines }}"
+
+    - name: Run cluster health verification checks
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cli="{{ redis_current_symlink }}/bin/redis-cli"
+        fail=0
+
+        pass() { echo "PASS - $1"; }
+        fail_check() { echo "FAIL - $1"; fail=1; }
+
+        versions_file="$(mktemp)"
+        while read -r addr; do
+          host="${addr%:*}"
+          port="${addr#*:}"
+          "$cli" -h "$host" -p "$port" --raw INFO server | awk -F: '/redis_version/ { gsub(/\r/, "", $2); print $2 }' >> "$versions_file"
+        done < <("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES | awk '{ split($2, a, "@"); print a[1] }')
+        version_count=$(sort -u "$versions_file" | wc -l)
+        if [ "$version_count" -eq 1 ]; then
+          pass "version consistency ($(sort -u "$versions_file"))"
+        else
+          fail_check "version consistency ($(sort -u "$versions_file" | paste -sd ',' -))"
+        fi
+        rm -f "$versions_file"
+
+        cluster_state=$("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER INFO | awk -F: '/cluster_state/ { gsub(/\r/, "", $2); print $2 }')
+        if [ "$cluster_state" = "ok" ]; then
+          pass "cluster_state:ok"
+        else
+          fail_check "cluster_state:${cluster_state}"
+        fi
+
+        if "$cli" --cluster check "{{ first_ip }}:{{ redis_port }}" --cluster-search-multiple-owners >/tmp/redis-cluster-check.txt 2>&1; then
+          if grep -q "All 16384 slots covered" /tmp/redis-cluster-check.txt; then
+            pass "topology health (all {{ cluster_slots_total }} hash slots covered)"
+          else
+            fail_check "topology health (slot coverage check did not confirm all slots)"
+          fi
+        else
+          cat /tmp/redis-cluster-check.txt
+          fail_check "topology health (redis-cli --cluster check failed)"
+        fi
+
+        masters_without_replicas=$("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES \
+          | awk '$3 ~ /master/ && $3 !~ /fail/ { masters[$1]=0 } $3 ~ /slave|replica/ && $3 !~ /fail/ { replicas[$4]++ } END { missing=0; for (m in masters) if (replicas[m] < 1) missing++; print missing }')
+        if [ "$masters_without_replicas" -eq 0 ]; then
+          pass "topology health (every master has at least one replica)"
+        else
+          fail_check "topology health (${masters_without_replicas} master(s) without replicas)"
+        fi
+
+        lag_failures=0
+        while read -r addr role; do
+          [ "$role" = "replica" ] || continue
+          host="${addr%:*}"
+          port="${addr#*:}"
+          link=$("$cli" -h "$host" -p "$port" --raw INFO replication | awk -F: '/master_link_status/ { gsub(/\r/, "", $2); print $2 }')
+          [ "$link" = "up" ] || lag_failures=$((lag_failures + 1))
+        done < <("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES | awk '{ split($2, a, "@"); role=($3 ~ /slave|replica/) ? "replica" : "master"; print a[1], role }')
+        if [ "$lag_failures" -eq 0 ]; then
+          pass "replication lag (all replica links up)"
+        else
+          fail_check "replication lag (${lag_failures} replica link(s) down)"
+        fi
+
+        exit "$fail"
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ first_node }}"
+      register: verify_full_result
+      changed_when: false
+
+    - name: Full verification summary
+      ansible.builtin.debug:
+        msg: "{{ verify_full_result.stdout_lines }}"

@@ -1,0 +1,20 @@
+- name: Verify deterministic Redis Cluster data
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Recompute and verify deterministic values
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
+
+    - name: Verification result
+      ansible.builtin.debug:
+        msg: "{{ data_verify_result.stdout_lines }}"

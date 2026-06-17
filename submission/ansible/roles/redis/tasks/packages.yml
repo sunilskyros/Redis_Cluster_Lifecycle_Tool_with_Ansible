@@ -1,0 +1,11 @@
+- name: Install packages required to build and run Redis
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - ca-certificates
+      - curl
+      - procps
+      - tcl
+    state: present
+    update_cache: false
+  become: true

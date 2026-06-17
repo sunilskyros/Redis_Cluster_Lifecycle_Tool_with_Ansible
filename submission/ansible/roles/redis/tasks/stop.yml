@@ -1,0 +1,20 @@
+- name: Check whether Redis is running
+  ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h 127.0.0.1 -p {{ redis_port }} PING"
+  register: redis_ping_before_stop
+  failed_when: false
+  changed_when: false
+
+- name: Stop Redis cleanly
+  ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h 127.0.0.1 -p {{ redis_port }} SHUTDOWN NOSAVE"
+  become: true
+  failed_when: false
+  changed_when: true
+  when: redis_ping_before_stop.rc == 0
+
+- name: Wait until Redis port is closed
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ redis_port }}"
+    state: stopped
+    timeout: 30
+  when: redis_ping_before_stop.rc == 0

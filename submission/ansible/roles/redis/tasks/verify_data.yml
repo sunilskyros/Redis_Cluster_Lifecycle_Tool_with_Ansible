@@ -1,0 +1,36 @@
+---
+- name: Recompute and verify deterministic values
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cli="{{ redis_current_symlink }}/bin/redis-cli"
+    verified=0
+    failures=0
+
+    for n in $(seq 1 {{ keys_count | int }}); do
+      suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
+      key="{{ data_key_prefix }}${suffix}"
+      expected=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
+      val=$("$cli" -c -h "{{ target_host }}" -p "{{ redis_port }}" GET "$key" 2>/dev/null || true)
+      
+      # Strip carriage return and whitespace
+      val=$(echo "$val" | tr -d '\r' | xargs)
+      expected=$(echo "$expected" | tr -d '\r' | xargs)
+
+      if [ "$val" = "$expected" ]; then
+        verified=$((verified + 1))
+      else
+        failures=$((failures + 1))
+      fi
+    done
+
+    echo "Verification Summary"
+    echo "total keys checked: {{ keys_count | int }}"
+    echo "keys verified: ${verified}"
+    echo "failures: ${failures}"
+
+    test "$failures" -eq 0
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ delegate_node }}"
+  register: data_verify_result
+  changed_when: false

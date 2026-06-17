@@ -1,0 +1,82 @@
+services:
+  redis-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: redis-node-base:latest
+    container_name: redis-node-1
+    hostname: redis-node-1
+    ports:
+      - "2221:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.11
+
+  redis-node-2:
+    image: redis-node-base:latest
+    container_name: redis-node-2
+    hostname: redis-node-2
+    ports:
+      - "2222:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.12
+
+  redis-node-3:
+    image: redis-node-base:latest
+    container_name: redis-node-3
+    hostname: redis-node-3
+    ports:
+      - "2223:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.13
+
+  redis-node-4:
+    image: redis-node-base:latest
+    container_name: redis-node-4
+    hostname: redis-node-4
+    ports:
+      - "2224:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.14
+
+  redis-node-5:
+    image: redis-node-base:latest
+    container_name: redis-node-5
+    hostname: redis-node-5
+    ports:
+      - "2225:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.15
+
+  redis-node-6:
+    image: redis-node-base:latest
+    container_name: redis-node-6
+    hostname: redis-node-6
+    ports:
+      - "2226:22"
+    volumes:
+      - ./ssh/authorized_keys:/home/ansible/.ssh/authorized_keys:ro
+    networks:
+      redis-cluster:
+        ipv4_address: 10.10.0.16
+
+networks:
+  redis-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24

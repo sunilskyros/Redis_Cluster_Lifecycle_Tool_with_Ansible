@@ -1,0 +1,225 @@
+- name: Rolling upgrade pre-flight checks
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Verify cluster is healthy before upgrade
+      ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ first_ip }} -p {{ redis_port }} CLUSTER INFO"
+      delegate_to: "{{ first_node }}"
+      register: preflight_cluster_info
+      changed_when: false
+      failed_when: "'cluster_state:ok' not in preflight_cluster_info.stdout"
+
+    - name: Verify every Redis node is reachable
+      ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ hostvars[item].redis_cluster_ip }} -p {{ redis_port }} PING"
+      delegate_to: "{{ first_node }}"
+      loop: "{{ groups['redis_nodes'] }}"
+      changed_when: false
+      register: reachability
+
+    - name: Collect node versions
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ redis_current_symlink }}/bin/redis-cli -h {{ hostvars[item].redis_cluster_ip }} -p {{ redis_port }} --raw INFO server \
+          | awk -F: '/redis_version/ { gsub(/\r/, "", $2); print $2 }'
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ first_node }}"
+      loop: "{{ groups['redis_nodes'] }}"
+      register: version_checks
+      changed_when: false
+
+    - name: Decide whether an upgrade is required
+      ansible.builtin.set_fact:
+        upgrade_required: "{{ version_checks.results | map(attribute='stdout') | unique | list != [target_version] }}"
+
+    - name: Stop cleanly when every node is already on target version
+      ansible.builtin.debug:
+        msg: "All nodes already report Redis {{ target_version }}; no upgrade required."
+      when: not upgrade_required | bool
+
+    - name: Pre-upgrade data integrity baseline
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
+      when: upgrade_required | bool
+
+- name: Upgrade replicas first, one at a time
+  hosts: redis_replicas_initial
+  gather_facts: true
+  become: true
+  serial: 1
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    redis_version: "{{ target_version }}"
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Upgrade replica when needed
+      when: hostvars['localhost'].upgrade_required | default(true) | bool
+      block:
+        - name: Stop replica Redis
+          ansible.builtin.include_role:
+            name: redis
+            tasks_from: stop
+
+        - name: Install target Redis on replica and restart
+          ansible.builtin.include_role:
+            name: redis
+
+        - name: Wait for replica synchronization
+          ansible.builtin.shell: |
+            set -euo pipefail
+            {{ redis_current_symlink }}/bin/redis-cli -h 127.0.0.1 -p {{ redis_port }} --raw INFO replication \
+              | awk -F: '/master_link_status/ { gsub(/\r/, "", $2); print $2 }'
+          args:
+            executable: /bin/bash
+          register: replica_sync
+          retries: 60
+          delay: 2
+          until: replica_sync.stdout == "up"
+          changed_when: false
+
+        - name: Verify cluster health after replica upgrade
+          ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ first_ip }} -p {{ redis_port }} CLUSTER INFO"
+          delegate_to: "{{ first_node }}"
+          register: replica_cluster_info
+          changed_when: false
+          failed_when: "'cluster_state:ok' not in replica_cluster_info.stdout"
+
+        - name: Replica upgrade progress
+          ansible.builtin.debug:
+            msg: "Upgraded replica {{ redis_cluster_ip }}:{{ redis_port }} to {{ target_version }} - cluster: ok"
+
+- name: Upgrade masters with failover, one at a time
+  hosts: redis_masters_initial
+  gather_facts: true
+  become: true
+  serial: 1
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    redis_version: "{{ target_version }}"
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Upgrade master when needed
+      when: hostvars['localhost'].upgrade_required | default(true) | bool
+      block:
+        - name: Promote this master's upgraded replica
+          ansible.builtin.shell: |
+            set -euo pipefail
+            cli="{{ redis_current_symlink }}/bin/redis-cli"
+            old_master="{{ redis_cluster_ip }}:{{ redis_port }}"
+            nodes_file="$(mktemp)"
+            "$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES > "$nodes_file"
+            master_id=$(awk -v addr="$old_master" '$2 ~ "^" addr "@" { print $1 }' "$nodes_file")
+            replica_addr=$(awk -v mid="$master_id" '$4 == mid && $3 ~ /slave|replica/ && $8 == "connected" { split($2, a, "@"); print a[1]; exit }' "$nodes_file")
+            rm -f "$nodes_file"
+            if [ -z "$replica_addr" ]; then
+              echo "No connected replica found for ${old_master}" >&2
+              exit 1
+            fi
+            replica_host="${replica_addr%:*}"
+            replica_port="${replica_addr#*:}"
+            "$cli" -h "$replica_host" -p "$replica_port" CLUSTER FAILOVER
+            for _ in $(seq 1 60); do
+              nodes=$("$cli" -h "{{ first_ip }}" -p "{{ redis_port }}" --raw CLUSTER NODES)
+              if printf "%s\n" "$nodes" | awk -v addr="$replica_addr" '$2 ~ "^" addr "@" && $3 ~ /master/ { found=1 } END { exit found ? 0 : 1 }'; then
+                echo "Promoted ${replica_addr}; old master ${old_master} is ready for upgrade"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Timed out waiting for failover of ${old_master}" >&2
+            exit 1
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ first_node }}"
+          register: failover_result
+          changed_when: true
+
+        - name: Verify cluster health after failover
+          ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ first_ip }} -p {{ redis_port }} CLUSTER INFO"
+          delegate_to: "{{ first_node }}"
+          register: master_failover_cluster_info
+          changed_when: false
+          failed_when: "'cluster_state:ok' not in master_failover_cluster_info.stdout"
+
+        - name: Stop old master after failover
+          ansible.builtin.include_role:
+            name: redis
+            tasks_from: stop
+
+        - name: Install target Redis on old master and restart as replica
+          ansible.builtin.include_role:
+            name: redis
+
+        - name: Wait for old master to rejoin as a synced replica
+          ansible.builtin.shell: |
+            set -euo pipefail
+            {{ redis_current_symlink }}/bin/redis-cli -h 127.0.0.1 -p {{ redis_port }} --raw INFO replication \
+              | awk -F: '/master_link_status/ { gsub(/\r/, "", $2); print $2 }'
+          args:
+            executable: /bin/bash
+          register: old_master_sync
+          retries: 60
+          delay: 2
+          until: old_master_sync.stdout == "up"
+          changed_when: false
+
+        - name: Verify cluster health after master upgrade
+          ansible.builtin.command: "{{ redis_current_symlink }}/bin/redis-cli -h {{ first_ip }} -p {{ redis_port }} CLUSTER INFO"
+          delegate_to: "{{ first_node }}"
+          register: master_cluster_info
+          changed_when: false
+          failed_when: "'cluster_state:ok' not in master_cluster_info.stdout"
+
+        - name: Master upgrade progress
+          ansible.builtin.debug:
+            msg: "Upgraded old master {{ redis_cluster_ip }}:{{ redis_port }} to {{ target_version }} after failover - cluster: ok"
+
+- name: Post-upgrade verification
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../group_vars/all.yml"
+  vars:
+    first_node: "{{ groups['redis_nodes'][0] }}"
+    first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
+  tasks:
+    - name: Run post-upgrade verification when needed
+      when: hostvars['localhost'].upgrade_required | default(true) | bool
+      block:
+        - name: Verify data after upgrade
+          ansible.builtin.include_role:
+            name: redis
+            tasks_from: verify_data
+          vars:
+            target_host: "{{ first_ip }}"
+            delegate_node: "{{ first_node }}"
+
+        - name: Verify all nodes report target version
+          ansible.builtin.shell: |
+            set -euo pipefail
+            {{ redis_current_symlink }}/bin/redis-cli -h {{ hostvars[item].redis_cluster_ip }} -p {{ redis_port }} --raw INFO server \
+              | awk -F: '/redis_version/ { gsub(/\r/, "", $2); print $2 }'
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ first_node }}"
+          loop: "{{ groups['redis_nodes'] }}"
+          register: final_versions
+          changed_when: false
+          failed_when: final_versions.stdout != target_version
+
+        - name: Print completion summary
+          ansible.builtin.debug:
+            msg: "UPGRADE COMPLETE - all nodes on v{{ target_version }}, data integrity verified"

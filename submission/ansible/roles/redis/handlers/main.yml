@@ -1,0 +1,2 @@
+- name: restart redis
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/restart.yml"
