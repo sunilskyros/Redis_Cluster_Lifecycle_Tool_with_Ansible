@@ -7,7 +7,19 @@
     first_node: "{{ groups['redis_nodes'][0] }}"
     first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
   tasks:
-    - name: Run full verification checks
+    - name: Verify data integrity
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
+
+    - name: Data integrity result
+      ansible.builtin.debug:
+        msg: "{{ data_verify_result.stdout_lines }}"
+
+    - name: Run cluster health verification checks
       ansible.builtin.shell: |
         set -euo pipefail
         cli="{{ redis_current_symlink }}/bin/redis-cli"
@@ -15,24 +27,6 @@
 
         pass() { echo "PASS - $1"; }
         fail_check() { echo "FAIL - $1"; fail=1; }
-
-        verified=0
-        missing=0
-        mismatched=0
-        for n in $(seq 1 {{ keys_count | int }}); do
-          suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
-          key="{{ data_key_prefix }}${suffix}"
-          expected=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
-          actual=$("$cli" -c -h "{{ first_ip }}" -p "{{ redis_port }}" --raw GET "$key" || true)
-          if [ -z "$actual" ]; then missing=$((missing + 1));
-          elif [ "$actual" != "$expected" ]; then mismatched=$((mismatched + 1));
-          else verified=$((verified + 1)); fi
-        done
-        if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
-          pass "data integrity (${verified}/{{ keys_count | int }} keys)"
-        else
-          fail_check "data integrity (${missing} missing, ${mismatched} mismatched)"
-        fi
 
         versions_file="$(mktemp)"
         while read -r addr; do

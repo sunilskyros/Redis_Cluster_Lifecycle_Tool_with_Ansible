@@ -6,10 +6,24 @@ supervised no
 pidfile {{ redis_run_dir }}/redis-{{ redis_port }}.pid
 logfile "{{ redis_log_dir }}/redis-{{ redis_port }}.log"
 dir {{ redis_data_dir }}
+loglevel {{ redis_loglevel | default('notice') }}
 
+# Persistence
 appendonly yes
 save ""
 
+# Memory
+{% if redis_maxmemory is defined %}
+maxmemory {{ redis_maxmemory }}
+maxmemory-policy {{ redis_maxmemory_policy | default('noeviction') }}
+{% endif %}
+
+# Network tuning
+tcp-backlog {{ redis_tcp_backlog | default(511) }}
+tcp-keepalive {{ redis_tcp_keepalive | default(300) }}
+timeout {{ redis_timeout | default(0) }}
+
+# Cluster
 cluster-enabled yes
 cluster-config-file {{ redis_cluster_config_file }}
 cluster-node-timeout {{ redis_cluster_node_timeout }}

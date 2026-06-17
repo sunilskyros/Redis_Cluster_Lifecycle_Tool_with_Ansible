@@ -8,39 +8,13 @@
     first_ip: "{{ hostvars[first_node].redis_cluster_ip }}"
   tasks:
     - name: Recompute and verify deterministic values
-      ansible.builtin.shell: |
-        set -euo pipefail
-        cli="{{ redis_current_symlink }}/bin/redis-cli"
-        verified=0
-        missing=0
-        mismatched=0
-
-        for n in $(seq 1 {{ keys_count | int }}); do
-          suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
-          key="{{ data_key_prefix }}${suffix}"
-          expected=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
-          actual=$("$cli" -c -h "{{ first_ip }}" -p "{{ redis_port }}" --raw GET "$key" || true)
-          if [ -z "$actual" ]; then
-            missing=$((missing + 1))
-          elif [ "$actual" != "$expected" ]; then
-            mismatched=$((mismatched + 1))
-          else
-            verified=$((verified + 1))
-          fi
-        done
-
-        if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
-          echo "PASS - ${verified}/{{ keys_count | int }} keys verified"
-        else
-          echo "FAIL - ${missing} keys missing, ${mismatched} values mismatched, ${verified}/{{ keys_count | int }} verified"
-          exit 1
-        fi
-      args:
-        executable: /bin/bash
-      delegate_to: "{{ first_node }}"
-      register: verify_result
-      changed_when: false
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
 
     - name: Verification result
       ansible.builtin.debug:
-        msg: "{{ verify_result.stdout_lines }}"
+        msg: "{{ data_verify_result.stdout_lines }}"

@@ -43,31 +43,12 @@
       when: not upgrade_required | bool
 
     - name: Pre-upgrade data integrity baseline
-      ansible.builtin.shell: |
-        set -euo pipefail
-        cli="{{ redis_current_symlink }}/bin/redis-cli"
-        verified=0
-        missing=0
-        mismatched=0
-        for n in $(seq 1 {{ keys_count | int }}); do
-          suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
-          key="{{ data_key_prefix }}${suffix}"
-          expected=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
-          actual=$("$cli" -c -h "{{ first_ip }}" -p "{{ redis_port }}" --raw GET "$key" || true)
-          if [ -z "$actual" ]; then missing=$((missing + 1));
-          elif [ "$actual" != "$expected" ]; then mismatched=$((mismatched + 1));
-          else verified=$((verified + 1)); fi
-        done
-        if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
-          echo "PASS - ${verified}/{{ keys_count | int }} keys verified"
-        else
-          echo "FAIL - ${missing} keys missing, ${mismatched} values mismatched"
-          exit 1
-        fi
-      args:
-        executable: /bin/bash
-      delegate_to: "{{ first_node }}"
-      changed_when: false
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_data
+      vars:
+        target_host: "{{ first_ip }}"
+        delegate_node: "{{ first_node }}"
       when: upgrade_required | bool
 
 - name: Upgrade replicas first, one at a time
@@ -219,31 +200,12 @@
       when: hostvars['localhost'].upgrade_required | default(true) | bool
       block:
         - name: Verify data after upgrade
-          ansible.builtin.shell: |
-            set -euo pipefail
-            cli="{{ redis_current_symlink }}/bin/redis-cli"
-            verified=0
-            missing=0
-            mismatched=0
-            for n in $(seq 1 {{ keys_count | int }}); do
-              suffix=$(printf "%0{{ data_key_width | int }}d" "$n")
-              key="{{ data_key_prefix }}${suffix}"
-              expected=$(printf "%s" "$key" | sha256sum | awk '{print $1}')
-              actual=$("$cli" -c -h "{{ first_ip }}" -p "{{ redis_port }}" --raw GET "$key" || true)
-              if [ -z "$actual" ]; then missing=$((missing + 1));
-              elif [ "$actual" != "$expected" ]; then mismatched=$((mismatched + 1));
-              else verified=$((verified + 1)); fi
-            done
-            if [ "$missing" -eq 0 ] && [ "$mismatched" -eq 0 ]; then
-              echo "PASS - ${verified}/{{ keys_count | int }} keys verified"
-            else
-              echo "FAIL - ${missing} keys missing, ${mismatched} values mismatched"
-              exit 1
-            fi
-          args:
-            executable: /bin/bash
-          delegate_to: "{{ first_node }}"
-          changed_when: false
+          ansible.builtin.include_role:
+            name: redis
+            tasks_from: verify_data
+          vars:
+            target_host: "{{ first_ip }}"
+            delegate_node: "{{ first_node }}"
 
         - name: Verify all nodes report target version
           ansible.builtin.shell: |

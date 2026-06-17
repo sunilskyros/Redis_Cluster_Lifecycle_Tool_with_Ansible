@@ -13,7 +13,15 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TypedDict
+
+
+
+class Runtime(TypedDict):
+    """Typed container for detected container runtime metadata."""
+    name: str
+    cmd: list[str]
+    version: str
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,6 +33,7 @@ LOG_DIR = PROJECT_ROOT / "logs"
 SSH_DIR = INFRA_DIR / "ssh"
 SSH_KEY = SSH_DIR / "redis_cluster_key"
 AUTHORIZED_KEYS = SSH_DIR / "authorized_keys"
+REDIS_CLI_PATH = "/opt/redis/current/bin/redis-cli"
 
 MIN_ANSIBLE_VERSION = (2, 14, 0)
 
@@ -166,6 +175,108 @@ def log_event(operation: str, action: str, status: str, **extra: object) -> None
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+class AnsibleOutputParser:
+    """Parses Ansible stdout and prints a human-friendly summary."""
+
+    def __init__(self) -> None:
+        self.current_task = "Unknown Action"
+        self.node_actions: list[dict[str, str]] = []
+        self._capturing_json = False
+        self._json_lines: list[str] = []
+        self._brace_depth = 0
+
+    def feed(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+
+        # 1. Play/Task/Handler/Recap headers
+        play_match = re.match(r'^PLAY \[(.*?)\] \*+', line)
+        if play_match:
+            self._reset_json()
+            self.current_task = "Play: " + play_match.group(1).strip()
+            print(f"\n\033[1;36m[PLAY] {play_match.group(1).strip()}\033[0m")
+            return
+
+        task_match = re.match(r'^TASK \[(.*?)\] \*+', line)
+        if task_match:
+            self._reset_json()
+            self.current_task = task_match.group(1).strip()
+            print(f"\033[1;35m[TASK] {self.current_task}\033[0m")
+            return
+
+        handler_match = re.match(r'^RUNNING HANDLER \[(.*?)\] \*+', line)
+        if handler_match:
+            self._reset_json()
+            self.current_task = "Handler: " + handler_match.group(1).strip()
+            print(f"\033[1;35m[HANDLER] {handler_match.group(1).strip()}\033[0m")
+            return
+
+        if re.match(r'^PLAY RECAP \*+', line):
+            self._reset_json()
+            print(f"\n\033[1;36m[PLAY RECAP]\033[0m")
+            self.current_task = "Recap"
+            return
+
+        # 2. Host result lines
+        host_res_match = re.match(r'^(ok|changed|failed|fatal|skipping): \[(.*?)\]', stripped)
+        if host_res_match:
+            self._handle_host_result(host_res_match, stripped)
+            return
+
+        # 3. JSON capture for debug messages
+        if self._capturing_json:
+            self._json_lines.append(line)
+            self._brace_depth += line.count('{') - line.count('}')
+            if self._brace_depth <= 0:
+                self._flush_json()
+        elif self.current_task == "Recap":
+            print(f"  {stripped}")
+
+    def _reset_json(self) -> None:
+        self._capturing_json = False
+        self._json_lines = []
+        self._brace_depth = 0
+
+    def _handle_host_result(self, match: re.Match, stripped: str) -> None:
+        status_word = match.group(1)
+        host = match.group(2)
+
+        status_map = {
+            "ok": ("\033[32mOK\033[0m", "success"),
+            "changed": ("\033[33mCHANGED\033[0m", "success"),
+            "skipping": ("\033[37mSKIPPED\033[0m", "skipped"),
+        }
+        status_str, outcome = status_map.get(status_word, ("\033[31mFAILED\033[0m", "failed"))
+
+        print(f"  - {host}: {status_str}")
+        self.node_actions.append({
+            "timestamp": now_iso(),
+            "node": host,
+            "action": self.current_task,
+            "outcome": outcome,
+        })
+
+        if "=> {" in stripped:
+            self._capturing_json = True
+            self._json_lines.append("{")
+            self._brace_depth = 1
+
+    def _flush_json(self) -> None:
+        try:
+            data = json.loads("".join(self._json_lines))
+            msg = data.get("msg")
+            if msg:
+                if isinstance(msg, list):
+                    for m in msg:
+                        print(f"    \033[34m{m}\033[0m")
+                else:
+                    print(f"    \033[34m{msg}\033[0m")
+        except Exception:
+            pass
+        self._reset_json()
+
+
 def stream_command(
     cmd: list[str],
     operation: str,
@@ -199,12 +310,8 @@ def stream_command(
     print(f"\033[1;34m>>> {start_msg}\033[0m")
 
     full_output = []
-    node_actions = []
-    current_task = "Unknown Action"
     is_ansible = cmd[0] == "ansible-playbook"
-    
-    capturing_json = False
-    json_lines = []
+    parser = AnsibleOutputParser() if is_ansible else None
 
     with subprocess.Popen(
         cmd,
@@ -218,97 +325,10 @@ def stream_command(
         assert proc.stdout is not None
         for line in proc.stdout:
             full_output.append(line)
-            stripped = line.strip()
-            if not stripped:
-                continue
-            
-            if is_ansible:
-                # 1. Check for Play/Task lines
-                play_match = re.match(r'^PLAY \[(.*?)\] \*+', line)
-                task_match = re.match(r'^TASK \[(.*?)\] \*+', line)
-                handler_match = re.match(r'^RUNNING HANDLER \[(.*?)\] \*+', line)
-                recap_match = re.match(r'^PLAY RECAP \*+', line)
-                
-                if play_match:
-                    current_task = "Play: " + play_match.group(1).strip()
-                    print(f"\n\033[1;36m[PLAY] {play_match.group(1).strip()}\033[0m")
-                    capturing_json = False
-                    json_lines = []
-                    continue
-                elif task_match:
-                    current_task = task_match.group(1).strip()
-                    print(f"\033[1;35m[TASK] {current_task}\033[0m")
-                    capturing_json = False
-                    json_lines = []
-                    continue
-                elif handler_match:
-                    current_task = "Handler: " + handler_match.group(1).strip()
-                    print(f"\033[1;35m[HANDLER] {handler_match.group(1).strip()}\033[0m")
-                    capturing_json = False
-                    json_lines = []
-                    continue
-                elif recap_match:
-                    print(f"\n\033[1;36m[PLAY RECAP]\033[0m")
-                    current_task = "Recap"
-                    capturing_json = False
-                    json_lines = []
-                    continue
-                
-                # 2. Check for host results
-                host_res_match = re.match(r'^(ok|changed|failed|fatal|skipping): \[(.*?)\]', stripped)
-                if host_res_match:
-                    status_word = host_res_match.group(1)
-                    host = host_res_match.group(2)
-                    
-                    if status_word == "ok":
-                        status_str = "\033[32mOK\033[0m"
-                        outcome = "success"
-                    elif status_word == "changed":
-                        status_str = "\033[33mCHANGED\033[0m"
-                        outcome = "success"
-                    elif status_word == "skipping":
-                        status_str = "\033[37mSKIPPED\033[0m"
-                        outcome = "skipped"
-                    else:
-                        status_str = "\033[31mFAILED\033[0m"
-                        outcome = "failed"
-                        
-                    print(f"  - {host}: {status_str}")
-                    
-                    node_actions.append({
-                        "timestamp": now_iso(),
-                        "node": host,
-                        "action": current_task,
-                        "outcome": outcome
-                    })
-                    
-                    if "=> {" in stripped:
-                        capturing_json = True
-                        json_lines.append("{")
-                    continue
-                
-                # 3. Handle JSON capturing for debug message
-                if capturing_json:
-                    json_lines.append(line)
-                    if stripped == "}":
-                        try:
-                            data = json.loads("".join(json_lines))
-                            msg = data.get("msg")
-                            if msg:
-                                if isinstance(msg, list):
-                                    for m in msg:
-                                        print(f"    \033[34m{m}\033[0m")
-                                else:
-                                    print(f"    \033[34m{msg}\033[0m")
-                        except Exception:
-                            pass
-                        capturing_json = False
-                        json_lines = []
-                elif current_task == "Recap":
-                    print(f"  {stripped}")
-            else:
-                print(stripped)
-                
+            if parser:
+                parser.feed(line)
+            elif line.strip():
+                print(line.strip())
         rc = proc.wait()
 
     if output_file:
@@ -316,6 +336,7 @@ def stream_command(
             out.write(f"$ {' '.join(cmd)}\n\n")
             out.write("".join(full_output))
 
+    node_actions = parser.node_actions if parser else []
     log_event(operation, "finish", "ok" if rc == 0 else "failed", return_code=rc, node_actions=node_actions)
 
     if rc != 0:
@@ -402,6 +423,7 @@ def cmd_infra(args: argparse.Namespace, context: dict[str, object]) -> int:
     runtime = context["runtime"]
     assert isinstance(runtime, dict)
     if args.infra_action == "up":
+        resolve_port_conflicts(context)
         ensure_ssh_key()
         df = INFRA_DIR / "Dockerfile"
         cf = INFRA_DIR / "Containerfile"
@@ -481,7 +503,7 @@ def parse_cluster_nodes(context: dict[str, object]) -> list[dict[str, object]]:
     if not nodes:
         raise ToolError("No nodes found in inventory")
     first_node = nodes[0]["name"]
-    res = run_container_cmd(first_node, ["/opt/redis/current/bin/redis-cli", "-p", "6379", "CLUSTER", "NODES"], context)
+    res = run_container_cmd(first_node, [REDIS_CLI_PATH, "-p", "6379", "CLUSTER", "NODES"], context)
     if res.returncode != 0:
         raise ToolError(f"Failed to get CLUSTER NODES: {res.stdout}")
     
@@ -519,21 +541,128 @@ def parse_cluster_nodes(context: dict[str, object]) -> list[dict[str, object]]:
     return parsed
 
 
-def add_nodes_to_compose(count: int) -> list[str]:
+def is_port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except socket.error:
+            return True
+
+
+def find_free_port(start_port: int, exclude_ports: set[int]) -> int:
+    port = start_port
+    while True:
+        if port not in exclude_ports:
+            if not is_port_in_use(port):
+                return port
+        port += 1
+
+
+def get_running_container_port(compose: list[str], service_name: str) -> int | None:
+    cmd = compose + ["-f", str(INFRA_DIR / "compose.yml"), "port", service_name, "22"]
+    proc = run_capture(cmd)
+    if proc.returncode == 0 and proc.stdout.strip():
+        out = proc.stdout.strip()
+        if ":" in out:
+            port_str = out.split(":")[-1]
+        else:
+            port_str = out
+        try:
+            return int(port_str)
+        except ValueError:
+            return None
+    return None
+
+
+def update_ports_in_config_files(new_ports: dict[str, int]) -> None:
+    # 1. Update compose.yml
+    compose_path = INFRA_DIR / "compose.yml"
+    if compose_path.exists():
+        content = compose_path.read_text(encoding="utf-8")
+        for node_name, port in new_ports.items():
+            pattern = r"(  " + re.escape(node_name) + r":\s*\n(?:[^\n]*\n)*?\s*ports:\s*\n\s*-\s*\")(\d+)(:22\")"
+            content = re.sub(pattern, rf"\g<1>{port}\g<3>", content)
+        compose_path.write_text(content, encoding="utf-8")
+
+    # 2. Update hosts.ini
+    if INVENTORY.exists():
+        content = INVENTORY.read_text(encoding="utf-8")
+        for node_name, port in new_ports.items():
+            pattern = r"(\b" + re.escape(node_name) + r"\b.*?ansible_port=)\d+"
+            content = re.sub(pattern, rf"\g<1>{port}", content)
+        INVENTORY.write_text(content, encoding="utf-8")
+
+
+def resolve_port_conflicts(context: dict[str, object]) -> None:
+    nodes = parse_inventory()
+    if not nodes:
+        return
+
+    runtime = context["runtime"]
+    assert isinstance(runtime, dict)
+    compose = detect_compose(runtime)
+    if not compose:
+        return
+
+    allocated_ports = set()
+    changed = False
+    new_ports = {}
+
+    for node in nodes:
+        node_name = node["name"]
+        current_port_str = node["ansible_port"]
+        if not current_port_str:
+            continue
+        current_port = int(current_port_str)
+        
+        # Check if the container is already running and mapping this port
+        running_port = get_running_container_port(compose, node_name)
+        if running_port == current_port:
+            allocated_ports.add(current_port)
+            new_ports[node_name] = current_port
+        else:
+            if current_port in allocated_ports or is_port_in_use(current_port):
+                free_port = find_free_port(2221, allocated_ports)
+                print(f"[INFO] Port conflict detected for {node_name} on port {current_port}. Reassigning to free port {free_port}.")
+                allocated_ports.add(free_port)
+                new_ports[node_name] = free_port
+                changed = True
+            else:
+                allocated_ports.add(current_port)
+                new_ports[node_name] = current_port
+
+    if changed:
+        update_ports_in_config_files(new_ports)
+
+
+def add_nodes_to_compose(count: int, context: dict[str, object]) -> list[dict[str, object]]:
     compose_path = INFRA_DIR / "compose.yml"
     content = compose_path.read_text(encoding="utf-8")
     
     node_numbers = [int(n) for n in re.findall(r"redis-node-(\d+):", content)]
     max_node = max(node_numbers) if node_numbers else 6
     
+    # Find currently allocated ports
+    allocated_ports = set()
+    for n in parse_inventory():
+        if n.get("ansible_port"):
+            allocated_ports.add(int(n["ansible_port"]))
+
     new_nodes = []
     new_services_str = ""
     for i in range(1, count + 1):
         num = max_node + i
         ip_last_octet = 10 + num
-        ssh_port = 2220 + num
+        ssh_port = find_free_port(2220 + num, allocated_ports)
+        allocated_ports.add(ssh_port)
         node_name = f"redis-node-{num}"
-        new_nodes.append(node_name)
+        new_nodes.append({
+            "name": node_name,
+            "port": ssh_port,
+            "ip": f"10.10.0.{ip_last_octet}"
+        })
         
         service_template = f"""
   {node_name}:
@@ -569,19 +698,25 @@ def remove_nodes_from_compose(node_names: list[str]) -> None:
     compose_path.write_text(content, encoding="utf-8")
 
 
-def add_nodes_to_inventory(new_nodes: list[str]) -> None:
+def add_nodes_to_inventory(new_nodes: list[dict[str, object]]) -> None:
     content = INVENTORY.read_text(encoding="utf-8")
     lines = content.splitlines()
     new_lines = []
     
-    master_node = new_nodes[0]
-    replica_node = new_nodes[1]
+    master_node_info = new_nodes[0]
+    replica_node_info = new_nodes[1]
     
-    m_num = int(master_node.split("-")[-1])
-    r_num = int(replica_node.split("-")[-1])
+    master_node = master_node_info["name"]
+    replica_node = replica_node_info["name"]
     
-    m_line = f"{master_node} ansible_host=127.0.0.1 ansible_port={2220 + m_num} redis_cluster_ip=10.10.0.{10 + m_num} redis_initial_role=master"
-    r_line = f"{replica_node} ansible_host=127.0.0.1 ansible_port={2220 + r_num} redis_cluster_ip=10.10.0.{10 + r_num} redis_initial_role=replica redis_replica_of={master_node}"
+    m_port = master_node_info["port"]
+    r_port = replica_node_info["port"]
+    
+    m_ip = master_node_info["ip"]
+    r_ip = replica_node_info["ip"]
+    
+    m_line = f"{master_node} ansible_host=127.0.0.1 ansible_port={m_port} redis_cluster_ip={m_ip} redis_initial_role=master"
+    r_line = f"{replica_node} ansible_host=127.0.0.1 ansible_port={r_port} redis_cluster_ip={r_ip} redis_initial_role=replica redis_replica_of={master_node}"
     
     in_redis_nodes = False
     in_masters = False
@@ -648,7 +783,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
     version = "7.0.15"
     try:
         first_node = existing_nodes[0]["name"]
-        res = run_container_cmd(first_node, ["/opt/redis/current/bin/redis-cli", "-p", "6379", "INFO", "server"], context)
+        res = run_container_cmd(first_node, [REDIS_CLI_PATH, "-p", "6379", "INFO", "server"], context)
         if res.returncode == 0:
             v_match = re.search(r'redis_version:(.*)', res.stdout)
             if v_match:
@@ -658,7 +793,8 @@ def scale_out(count: int, context: dict[str, object]) -> int:
         
     print(f"Detected running cluster version: {version}")
 
-    new_node_names = add_nodes_to_compose(count)
+    new_nodes_info = add_nodes_to_compose(count, context)
+    new_node_names = [n["name"] for n in new_nodes_info]
     print(f"Added new nodes to compose.yml: {', '.join(new_node_names)}")
 
     runtime = context["runtime"]
@@ -676,7 +812,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
     print("Waiting for containers to boot SSH services...")
     time.sleep(5)
 
-    add_nodes_to_inventory(new_node_names)
+    add_nodes_to_inventory(new_nodes_info)
     print("Added new nodes to hosts.ini.")
 
     new_masters_count = len(masters) + (count // 2)
@@ -705,7 +841,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
     print(f"Adding new master {master_node_info['name']} ({master_node_info['ip']}:6379) to cluster...")
     res = run_container_cmd(
         first_node,
-        ["/opt/redis/current/bin/redis-cli", "--cluster", "add-node", f"{master_node_info['ip']}:6379", f"{first_node_ip}:6379"],
+        [REDIS_CLI_PATH, "--cluster", "add-node", f"{master_node_info['ip']}:6379", f"{first_node_ip}:6379"],
         context
     )
     if res.returncode != 0:
@@ -730,7 +866,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
     res = run_container_cmd(
         first_node,
         [
-            "/opt/redis/current/bin/redis-cli",
+            REDIS_CLI_PATH,
             "--cluster", "add-node",
             f"{replica_node_info['ip']}:6379",
             f"{first_node_ip}:6379",
@@ -748,7 +884,7 @@ def scale_out(count: int, context: dict[str, object]) -> int:
     print("Rebalancing slots across all masters...")
     res = run_container_cmd(
         first_node,
-        ["/opt/redis/current/bin/redis-cli", "--cluster", "rebalance", f"{first_node_ip}:6379", "--cluster-use-empty-masters"],
+        [REDIS_CLI_PATH, "--cluster", "rebalance", f"{first_node_ip}:6379", "--cluster-use-empty-masters"],
         context
     )
     if res.returncode != 0:
@@ -832,7 +968,7 @@ def scale_in(node_id: str, context: dict[str, object]) -> int:
         res = run_container_cmd(
             active_container,
             [
-                "/opt/redis/current/bin/redis-cli",
+                REDIS_CLI_PATH,
                 "--cluster", "reshard", f"{active_node['ip']}:6379",
                 "--cluster-from", master_node["id"],
                 "--cluster-to", target_master["id"],
@@ -850,7 +986,7 @@ def scale_in(node_id: str, context: dict[str, object]) -> int:
         res = run_container_cmd(
             active_container,
             [
-                "/opt/redis/current/bin/redis-cli",
+                REDIS_CLI_PATH,
                 "--cluster", "del-node", f"{active_node['ip']}:6379",
                 replica_node["id"]
             ],
@@ -863,7 +999,7 @@ def scale_in(node_id: str, context: dict[str, object]) -> int:
     res = run_container_cmd(
         active_container,
         [
-            "/opt/redis/current/bin/redis-cli",
+            REDIS_CLI_PATH,
             "--cluster", "del-node", f"{active_node['ip']}:6379",
             master_node["id"]
         ],
@@ -908,38 +1044,45 @@ def cmd_scale(args: argparse.Namespace, context: dict[str, object]) -> int:
         raise ToolError("Invalid scale arguments")
 
 
-def cmd_provision(args: argparse.Namespace, context: dict[str, object]) -> int:
+def check_all_nodes_version(target_version: str, context: dict[str, object]) -> bool:
+    """Return True if all cluster nodes are already running the specified version."""
     try:
-        if is_infra_running(context):
-            nodes = parse_cluster_nodes(context)
-            if nodes:
-                inventory_nodes = parse_inventory()
-                first_container = inventory_nodes[0]["name"]
-                all_correct_version = True
-                for node in nodes:
-                    res = run_container_cmd(first_container, ["/opt/redis/current/bin/redis-cli", "-h", node["ip"], "-p", "6379", "INFO", "server"], context)
-                    if res.returncode == 0:
-                        v_match = re.search(r'redis_version:(.*)', res.stdout)
-                        if v_match:
-                            v = v_match.group(1).strip()
-                            if v != args.version:
-                                all_correct_version = False
-                                break
-                        else:
-                            all_correct_version = False
-                            break
-                    else:
-                        all_correct_version = False
-                        break
-                
-                res_info = run_container_cmd(first_container, ["/opt/redis/current/bin/redis-cli", "-p", "6379", "CLUSTER", "INFO"], context)
-                cluster_ok = "cluster_state:ok" in res_info.stdout
-                
-                if all_correct_version and cluster_ok:
-                    print(f"Cluster is already provisioned and healthy with Redis {args.version}. No action required.")
-                    return 0
+        if not is_infra_running(context):
+            return False
+        nodes = parse_cluster_nodes(context)
+        if not nodes:
+            return False
+        inventory_nodes = parse_inventory()
+        if not inventory_nodes:
+            return False
+        first_container = inventory_nodes[0]["name"]
+        for node in nodes:
+            res = run_container_cmd(
+                first_container,
+                [REDIS_CLI_PATH, "-h", node["ip"], "-p", "6379", "INFO", "server"],
+                context,
+            )
+            if res.returncode != 0:
+                return False
+            v_match = re.search(r'redis_version:(.*)', res.stdout)
+            if not v_match or v_match.group(1).strip() != target_version:
+                return False
+        return True
     except Exception:
-        pass
+        return False
+
+
+def cmd_provision(args: argparse.Namespace, context: dict[str, object]) -> int:
+    if check_all_nodes_version(args.version, context):
+        first_container = parse_inventory()[0]["name"]
+        res_info = run_container_cmd(
+            first_container,
+            [REDIS_CLI_PATH, "-p", "6379", "CLUSTER", "INFO"],
+            context,
+        )
+        if "cluster_state:ok" in res_info.stdout:
+            print(f"Cluster is already provisioned and healthy with Redis {args.version}. No action required.")
+            return 0
 
     return ansible_playbook(
         "provision.yml",
@@ -995,35 +1138,10 @@ def cmd_status(_args: argparse.Namespace, _context: dict[str, object]) -> int:
 def cmd_upgrade(args: argparse.Namespace, context: dict[str, object]) -> int:
     if args.strategy != "rolling":
         raise ToolError("Only --strategy rolling is implemented.")
-    
-    try:
-        if is_infra_running(context):
-            nodes = parse_cluster_nodes(context)
-            if nodes:
-                inventory_nodes = parse_inventory()
-                first_container = inventory_nodes[0]["name"]
-                all_target_version = True
-                for node in nodes:
-                    res = run_container_cmd(first_container, ["/opt/redis/current/bin/redis-cli", "-h", node["ip"], "-p", "6379", "INFO", "server"], context)
-                    if res.returncode == 0:
-                        v_match = re.search(r'redis_version:(.*)', res.stdout)
-                        if v_match:
-                            v = v_match.group(1).strip()
-                            if v != args.target_version:
-                                all_target_version = False
-                                break
-                        else:
-                            all_target_version = False
-                            break
-                    else:
-                        all_target_version = False
-                        break
-                
-                if all_target_version:
-                    print(f"All nodes are already running Redis {args.target_version}. No upgrade required.")
-                    return 0
-    except Exception:
-        pass
+
+    if check_all_nodes_version(args.target_version, context):
+        print(f"All nodes are already running Redis {args.target_version}. No upgrade required.")
+        return 0
 
     keys = get_keys_count(args)
     return ansible_playbook(
